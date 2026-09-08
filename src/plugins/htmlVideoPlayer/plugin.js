@@ -122,7 +122,10 @@ function enableNativeTrackSupport(mediaSource, track) {
 function requireHlsPlayer(callback) {
     import('hls.js/dist/hls.js').then(({ default: hls }) => {
         hls.DefaultConfig.lowLatencyMode = false;
-        hls.DefaultConfig.backBufferLength = Infinity;
+        hls.DefaultConfig.maxBufferLength = 7200;
+        hls.DefaultConfig.maxMaxBufferLength = 14400;
+        hls.DefaultConfig.maxBufferSize = 2 * 1024 * 1024 * 1024;
+        hls.DefaultConfig.backBufferLength = 1800;
         hls.DefaultConfig.liveBackBufferLength = 90;
         window.Hls = hls;
         callback();
@@ -552,23 +555,24 @@ export class HtmlVideoPlayer {
     setSrcWithHlsJs(elem, options, url) {
         return new Promise((resolve, reject) => {
             requireHlsPlayer(async () => {
-                let maxBufferLength = 30;
-
-                // Some browsers cannot handle huge fragments in high bitrate.
-                // This issue usually happens when using HWA encoders with a high bitrate setting.
-                // Limit the BufferLength to 6s, it works fine when playing 4k 120Mbps over HLS on chrome.
-                // https://github.com/video-dev/hls.js/issues/876
-                if ((browser.chrome || browser.edgeChromium || browser.firefox) && playbackManager.getMaxStreamingBitrate(this) >= 25000000) {
-                    maxBufferLength = 6;
-                }
+                // PotPlayer-style full episode continuous prebuffering (2 hours ahead, 2GB RAM buffer)
+                const maxBufferLength = 7200;
+                const maxMaxBufferLength = 14400;
+                const maxBufferSize = 2 * 1024 * 1024 * 1024;
+                const backBufferLength = 1800;
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
 
                 const hls = new Hls({
                     startPosition: options.playerStartPositionTicks / 10000000,
-                    manifestLoadingTimeOut: 20000,
+                    manifestLoadingTimeOut: 30000,
                     maxBufferLength: maxBufferLength,
-                    maxMaxBufferLength: maxBufferLength,
+                    maxMaxBufferLength: maxMaxBufferLength,
+                    maxBufferSize: maxBufferSize,
+                    backBufferLength: backBufferLength,
+                    maxBufferHole: 0.5,
+                    highBufferWatchdogPeriod: 2,
+                    lowLatencyMode: false,
                     videoPreference: { preferHDR: true },
                     xhrSetup(xhr) {
                         xhr.withCredentials = includeCorsCredentials;
@@ -650,6 +654,7 @@ export class HtmlVideoPlayer {
             return this.setSrcWithFlvJs(elem, options, val);
         } else {
             elem.autoplay = true;
+            elem.preload = 'auto'; // PotPlayer-style: aggressively pre-buffer direct play video
 
             const includeCorsCredentials = await getIncludeCorsCredentials();
             if (includeCorsCredentials) {

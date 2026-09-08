@@ -519,6 +519,9 @@ export class HtmlVideoPlayer {
         const elem = await this.createMediaElement(options);
         this.#applyAspectRatio(options.aspectRatio || this.getAspectRatio());
 
+        window.__currentVideoPlayer = this;
+        window.__currentPlayOptions = options;
+
         await this.updateVideoUrl(options);
         return this.setCurrentSrc(elem, options);
     }

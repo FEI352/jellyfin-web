@@ -4422,6 +4422,7 @@ export class PlaybackManager {
 }
 
 export const playbackManager = new PlaybackManager();
+window.playbackManager = playbackManager;
 bindMediaSegmentManager(playbackManager);
 bindMediaSessionSubscriber(playbackManager);
 

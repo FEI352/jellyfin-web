@@ -1,14 +1,88 @@
 // Jellyfin Custom Enhancement:
-// 1. PotPlayer-Style Aggressive Full-Episode Buffering Engine (7200s, 2GB Buffer)
-// 2. PotPlayer-Style Bottom Control Bar HUD (Realtime Buffer, 88VIP Speed, Decode Switcher)
+// 1. PotPlayer-Style Continuous Buffer Engine (7200s, 2GB Buffer, Background Buffering on Pause)
+// 2. Minimalist English HUD (Realtime Speed, Dynamic Buffer Progress, Decode Switcher)
 // 3. Persistent "最近观看" (Recently Watched) Section with Playback Progress & History
 
 (function() {
     'use strict';
 
     // =========================================================================
-    // 1. PotPlayer-Style Aggressive Buffering Engine
+    // 1. PotPlayer-Style Continuous Buffering Engine & HLS DirectStream Routing
     // =========================================================================
+    let forceDirectPlayNative = false;
+    let activeHlsInstance = null;
+    let instantSpeedBps = 0;
+    let smoothedSpeedBps = 0;
+    let lastChunkDownloadedTime = 0;
+    let effectiveBitrateBps = 8000000; // fallback 8 Mbps
+
+    // Intercept PlaybackInfo requests to remove Video from DirectPlayProfiles
+    // This routes video through HLS DirectStream (Video: copy, Audio: copy, 0% CPU transcode overhead)
+    // which enables Hls.js to continuously pre-buffer the ENTIRE episode even when PAUSED!
+    const origXhrOpen = XMLHttpRequest.prototype.open;
+    const origXhrSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._pp_url = typeof url === 'string' ? url : '';
+        return origXhrOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function(body) {
+        const url = this._pp_url || '';
+
+        // Filter out Video DirectPlay for continuous HLS prebuffering
+        if (!forceDirectPlayNative && typeof body === 'string' && body.includes('DirectPlayProfiles')) {
+            try {
+                const parsed = JSON.parse(body);
+                if (parsed.DeviceProfile && Array.isArray(parsed.DeviceProfile.DirectPlayProfiles)) {
+                    parsed.DeviceProfile.DirectPlayProfiles = parsed.DeviceProfile.DirectPlayProfiles.filter(p => p.Type !== 'Video');
+                    arguments[0] = JSON.stringify(parsed);
+                    console.log('[PotPlayer-Buffer] Filtered DirectPlayProfiles -> HLS DirectStream active for full background prebuffering');
+                }
+            } catch (e) {}
+        }
+
+        // Network throughput measurement for video chunks
+        if (url.includes('/Videos/') || url.includes('/hls') || url.includes('.ts') || url.includes('.m4s') || url.includes('stream')) {
+            let prev = 0;
+            let startTime = Date.now();
+            this.addEventListener('progress', (e) => {
+                const now = Date.now();
+                const dt = (now - startTime) / 1000;
+                if (e.loaded > prev && dt > 0.08) {
+                    const delta = e.loaded - prev;
+                    instantSpeedBps = delta / dt;
+                    prev = e.loaded;
+                    startTime = now;
+                    lastChunkDownloadedTime = now;
+                }
+            });
+            this.addEventListener('load', () => {
+                lastChunkDownloadedTime = Date.now();
+            });
+        }
+
+        return origXhrSend.apply(this, arguments);
+    };
+
+    if (window.fetch) {
+        const origFetch = window.fetch;
+        window.fetch = function(input, init) {
+            if (!forceDirectPlayNative && init && typeof init.body === 'string' && init.body.includes('DirectPlayProfiles')) {
+                try {
+                    const parsed = JSON.parse(init.body);
+                    if (parsed.DeviceProfile && Array.isArray(parsed.DeviceProfile.DirectPlayProfiles)) {
+                        parsed.DeviceProfile.DirectPlayProfiles = parsed.DeviceProfile.DirectPlayProfiles.filter(p => p.Type !== 'Video');
+                        init.body = JSON.stringify(parsed);
+                        console.log('[PotPlayer-Buffer] Filtered fetch DirectPlayProfiles -> HLS DirectStream active');
+                    }
+                } catch (e) {}
+            }
+            return origFetch.apply(this, arguments);
+        };
+    }
+
+    // Configure HLS Player for 7200s (2hr) / 2GB continuous prebuffering
     function applyHlsBufferConfig(HlsClass) {
         if (!HlsClass) return;
         if (HlsClass.DefaultConfig) {
@@ -22,13 +96,6 @@
             HlsClass.DefaultConfig.progressive = true;
         }
     }
-
-    let activeHlsInstance = null;
-    let totalBytesDownloaded = 0;
-    let bytesInWindow = 0;
-    let windowStartTime = Date.now();
-    let lastChunkDownloadedTime = 0;
-    let currentSpeedBps = 0;
 
     function wrapHlsConstructor(OriginalHls) {
         if (!OriginalHls || OriginalHls.__potplayerWrapped) return OriginalHls;
@@ -48,17 +115,32 @@
             activeHlsInstance = inst;
             window.__potplayer_active_hls = inst;
 
-            if (OriginalHls.Events && OriginalHls.Events.FRAG_LOADED) {
-                inst.on(OriginalHls.Events.FRAG_LOADED, (event, data) => {
-                    if (data && data.stats) {
-                        lastChunkDownloadedTime = Date.now();
-                        const loaded = data.stats.total || data.stats.loaded || 0;
-                        if (loaded > 0) {
-                            bytesInWindow += loaded;
-                            totalBytesDownloaded += loaded;
+            // Hook fragment progress & load events for realtime speed monitoring
+            if (OriginalHls.Events) {
+                if (OriginalHls.Events.FRAG_LOAD_PROGRESS) {
+                    inst.on(OriginalHls.Events.FRAG_LOAD_PROGRESS, (event, data) => {
+                        const now = Date.now();
+                        lastChunkDownloadedTime = now;
+                        if (inst.bandwidthEstimate && inst.bandwidthEstimate > 0) {
+                            instantSpeedBps = inst.bandwidthEstimate / 8;
                         }
-                    }
-                });
+                    });
+                }
+                if (OriginalHls.Events.FRAG_LOADED) {
+                    inst.on(OriginalHls.Events.FRAG_LOADED, (event, data) => {
+                        const now = Date.now();
+                        lastChunkDownloadedTime = now;
+                        if (data && data.stats) {
+                            const bytes = data.stats.total || data.stats.loaded || 0;
+                            const dur = (data.stats.loading.end - data.stats.loading.start) / 1000;
+                            if (dur > 0 && bytes > 0) {
+                                instantSpeedBps = bytes / dur;
+                            } else if (inst.bandwidthEstimate) {
+                                instantSpeedBps = inst.bandwidthEstimate / 8;
+                            }
+                        }
+                    });
+                }
             }
             return inst;
         }
@@ -86,260 +168,276 @@
         }
     }
 
-    // Direct Play Video Pre-buffering
+    // Direct Play Video Pre-buffering & Progress Speed Tracking
+    let lastBufferedEndSec = 0;
+    let lastProgressTime = Date.now();
+
     document.addEventListener('play', (e) => {
         if (e.target && e.target.tagName === 'VIDEO') {
             const video = e.target;
             video.preload = 'auto';
-            console.log('[PotPlayer-Buffer] Video element detected. Set preload=auto for full pre-buffering.');
+            lastBufferedEndSec = 0;
+            lastProgressTime = Date.now();
+            if (activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
+                activeHlsInstance.startLoad();
+            }
         }
     }, true);
 
-    // Network throughput hook via XMLHttpRequest for video segments
-    try {
-        const origXhrOpen = XMLHttpRequest.prototype.open;
-        const origXhrSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function(method, url) {
-            this._potplayer_url = typeof url === 'string' ? url : '';
-            return origXhrOpen.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function() {
-            const url = this._potplayer_url || '';
-            if (url.includes('/Videos/') || url.includes('/hls') || url.includes('.ts') || url.includes('.m4s') || url.includes('stream')) {
-                let prevLoaded = 0;
-                this.addEventListener('progress', (e) => {
-                    if (e.loaded > prevLoaded) {
-                        const delta = e.loaded - prevLoaded;
-                        prevLoaded = e.loaded;
-                        bytesInWindow += delta;
-                        totalBytesDownloaded += delta;
-                        lastChunkDownloadedTime = Date.now();
-                    }
-                });
-                this.addEventListener('load', () => {
-                    lastChunkDownloadedTime = Date.now();
-                });
+    // CRITICAL: Ensure pre-buffering KEEPS RUNNING even when the user PAUSES the video!
+    document.addEventListener('pause', (e) => {
+        if (e.target && e.target.tagName === 'VIDEO') {
+            console.log('[PotPlayer-Buffer] Video paused. Forcing continuous background pre-buffering...');
+            if (activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
+                activeHlsInstance.startLoad();
             }
-            return origXhrSend.apply(this, arguments);
-        };
-    } catch (e) {}
+        }
+    }, true);
+
+    // Track buffer advancement on native video element
+    document.addEventListener('progress', (e) => {
+        if (e.target && e.target.tagName === 'VIDEO') {
+            const video = e.target;
+            if (!video.duration || isNaN(video.duration)) return;
+
+            const now = Date.now();
+            const dt = (now - lastProgressTime) / 1000;
+            const ct = video.currentTime || 0;
+
+            let currentEnd = 0;
+            for (let i = 0; i < video.buffered.length; i++) {
+                const s = video.buffered.start(i);
+                const end = video.buffered.end(i);
+                if (ct >= s - 1 && ct <= end + 1) {
+                    currentEnd = end;
+                    break;
+                }
+                if (end > currentEnd) currentEnd = end;
+            }
+
+            if (dt >= 0.25 && currentEnd > lastBufferedEndSec) {
+                const deltaSec = currentEnd - lastBufferedEndSec;
+                const bytes = deltaSec * (effectiveBitrateBps / 8);
+                instantSpeedBps = bytes / dt;
+                lastChunkDownloadedTime = now;
+                lastBufferedEndSec = currentEnd;
+                lastProgressTime = now;
+            } else if (currentEnd < lastBufferedEndSec) {
+                lastBufferedEndSec = currentEnd;
+                lastProgressTime = now;
+            }
+
+            // If paused and Hls is available, make sure startLoad stays active
+            if (video.paused && activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
+                activeHlsInstance.startLoad();
+            }
+        }
+    }, true);
 
     // =========================================================================
-    // 2. PotPlayer-Style Bottom Control Bar HUD & Realtime Monitoring
+    // 2. Minimalist English HUD Control Bar (PotPlayer Style)
     // =========================================================================
     const hudStyle = document.createElement('style');
-    hudStyle.id = 'potplayer-hud-style';
+    hudStyle.id = 'potplayer-minimal-style';
     hudStyle.textContent = `
-        /* PotPlayer HUD Container */
-        .videoOsdBottom-maincontrols .buttons .osdTimeText { margin-right: 0.6em !important; }
+        /* Align time display and HUD */
+        .videoOsdBottom-maincontrols .buttons .osdTimeText {
+            margin-right: 0.8em !important;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
+            font-size: 12px !important;
+        }
+
         .potplayer-hud {
             display: inline-flex !important;
             align-items: center !important;
-            gap: 6px !important;
-            margin-left: 0.8em !important;
+            gap: 4px !important;
             margin-right: auto !important;
             user-select: none !important;
             z-index: 100 !important;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
         }
 
-        .potplayer-badge {
+        .pp-badge {
             display: inline-flex;
             align-items: center;
-            gap: 4px;
-            height: 24px;
-            padding: 0 8px;
-            border-radius: 4px;
+            justify-content: center;
+            height: 20px;
+            padding: 0 6px;
+            border-radius: 3px;
             font-size: 11px;
-            font-weight: 600;
-            letter-spacing: 0.3px;
-            background: rgba(30, 30, 30, 0.85);
-            border: 1px solid rgba(255, 255, 255, 0.18);
-            color: #e0e0e0;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            font-weight: 500;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            background: rgba(18, 18, 22, 0.75);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            color: #d1d5db;
+            transition: all 0.15s ease;
             white-space: nowrap;
+            font-variant-numeric: tabular-nums;
         }
 
-        button.potplayer-badge {
+        button.pp-badge {
             cursor: pointer;
             outline: none;
         }
-        button.potplayer-badge:hover {
-            background: rgba(50, 50, 50, 0.95);
-            border-color: rgba(255, 255, 255, 0.35);
-            transform: translateY(-1px);
+        button.pp-badge:hover {
+            background: rgba(35, 35, 42, 0.95);
+            border-color: rgba(255, 255, 255, 0.3);
         }
 
         /* H/W Decode Button */
-        .potplayer-badge-hw {
-            background: rgba(45, 32, 10, 0.9) !important;
-            border: 1px solid rgba(255, 179, 0, 0.6) !important;
-            color: #ffb300 !important;
+        .pp-hw {
+            color: #f59e0b !important; /* Minimalist Amber */
+            border-color: rgba(245, 158, 11, 0.35) !important;
+            background: rgba(30, 24, 12, 0.8) !important;
         }
-        .potplayer-badge-hw:hover {
-            background: rgba(65, 48, 15, 0.95) !important;
-            box-shadow: 0 0 10px rgba(255, 179, 0, 0.45) !important;
+        .pp-hw:hover {
+            background: rgba(45, 34, 15, 0.95) !important;
+            border-color: #f59e0b !important;
         }
 
-        .potplayer-badge-sw {
-            background: rgba(10, 38, 48, 0.9) !important;
-            border: 1px solid rgba(0, 229, 255, 0.6) !important;
-            color: #00e5ff !important;
+        .pp-sw {
+            color: #38bdf8 !important; /* Minimalist Sky Blue */
+            border-color: rgba(56, 189, 248, 0.35) !important;
+            background: rgba(12, 26, 36, 0.8) !important;
         }
-        .potplayer-badge-sw:hover {
-            background: rgba(15, 55, 70, 0.95) !important;
-            box-shadow: 0 0 10px rgba(0, 229, 255, 0.45) !important;
+        .pp-sw:hover {
+            background: rgba(16, 38, 52, 0.95) !important;
+            border-color: #38bdf8 !important;
         }
 
         /* Codecs & Audio */
-        .potplayer-badge-codec {
-            color: #ffffff !important;
-            background: rgba(25, 25, 28, 0.85) !important;
+        .pp-codec {
+            color: #9ca3af;
         }
-        .potplayer-badge-audio {
-            color: #b0bec5 !important;
-            background: rgba(25, 25, 28, 0.85) !important;
+        .pp-audio {
+            color: #9ca3af;
         }
-        .potplayer-badge-audio:hover {
-            color: #ffffff !important;
-            border-color: rgba(255, 255, 255, 0.4) !important;
+        .pp-dim {
+            opacity: 0.65;
+            margin-left: 2px;
         }
 
-        /* Speed badge */
-        .potplayer-badge-speed {
-            font-variant-numeric: tabular-nums;
-            min-width: 78px;
-            justify-content: center;
+        /* Speed Badge */
+        .pp-speed {
+            min-width: 62px;
+            color: #6b7280;
         }
-        .potplayer-speed-fast {
-            color: #00e676 !important; /* 88VIP full speed green */
-            border-color: rgba(0, 230, 118, 0.5) !important;
-            background: rgba(0, 50, 20, 0.6) !important;
+        .pp-speed-fast {
+            color: #22c55e !important; /* Clean Green */
+            border-color: rgba(34, 197, 94, 0.35) !important;
         }
-        .potplayer-speed-normal {
-            color: #ffb300 !important;
-            border-color: rgba(255, 179, 0, 0.4) !important;
+        .pp-speed-normal {
+            color: #f59e0b !important;
         }
-        .potplayer-speed-slow {
-            color: #ff9100 !important;
-            border-color: rgba(255, 145, 0, 0.4) !important;
-        }
-        .potplayer-speed-idle {
-            color: rgba(255, 255, 255, 0.4) !important;
+        .pp-speed-slow {
+            color: #38bdf8 !important;
         }
 
-        /* Buffer badge */
-        .potplayer-badge-buffer {
-            font-variant-numeric: tabular-nums;
+        /* Buffer Badge */
+        .pp-buffer {
+            min-width: 76px;
+            color: #9ca3af;
         }
-        .potplayer-buffer-full {
-            color: #00e676 !important;
-            border-color: rgba(0, 230, 118, 0.5) !important;
+        .pp-buffer-full {
+            color: #22c55e !important;
+            border-color: rgba(34, 197, 94, 0.35) !important;
         }
 
-        /* Floating Dropdown Menu */
-        .potplayer-menu {
+        /* Minimalist Dark Popover */
+        .pp-menu {
             position: absolute;
-            bottom: 56px;
-            left: 140px;
-            background: rgba(22, 22, 26, 0.97);
-            backdrop-filter: blur(18px);
-            border: 1px solid rgba(255, 255, 255, 0.16);
-            border-radius: 8px;
-            padding: 6px;
-            min-width: 290px;
+            background: #141417;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 6px;
+            padding: 4px;
+            min-width: 240px;
             box-shadow: 0 12px 30px rgba(0, 0, 0, 0.7);
             z-index: 10000;
             display: flex;
             flex-direction: column;
-            gap: 2px;
-            animation: potplayerFadeIn 0.15s ease-out;
+            gap: 1px;
+            animation: ppFadeIn 0.12s ease-out;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
 
-        @keyframes potplayerFadeIn {
-            from { opacity: 0; transform: translateY(6px); }
+        @keyframes ppFadeIn {
+            from { opacity: 0; transform: translateY(4px); }
             to { opacity: 1; transform: translateY(0); }
         }
 
-        .potplayer-menu-header {
-            font-size: 11px;
+        .pp-menu-header {
+            font-size: 10px;
             font-weight: 700;
-            color: rgba(255, 255, 255, 0.5);
-            padding: 6px 10px 4px;
+            color: #6b7280;
+            padding: 5px 8px 3px;
+            letter-spacing: 0.6px;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
         }
 
-        .potplayer-menu-item {
+        .pp-menu-item {
             display: flex;
             align-items: center;
-            gap: 10px;
-            padding: 8px 10px;
-            border-radius: 6px;
+            justify-content: space-between;
+            padding: 6px 8px;
+            border-radius: 4px;
             cursor: pointer;
-            transition: background 0.15s ease;
+            font-size: 12px;
+            color: #d1d5db;
+            transition: background 0.12s ease;
         }
-        .potplayer-menu-item:hover {
-            background: rgba(255, 255, 255, 0.1);
-        }
-        .potplayer-menu-item.active {
-            background: rgba(255, 179, 0, 0.15);
-            border-left: 3px solid #ffb300;
-        }
-
-        .potplayer-menu-icon {
-            font-size: 16px;
-            flex-shrink: 0;
-        }
-        .potplayer-menu-title {
-            font-size: 13px;
-            font-weight: 600;
+        .pp-menu-item:hover {
+            background: rgba(255, 255, 255, 0.08);
             color: #ffffff;
         }
-        .potplayer-menu-desc {
-            font-size: 11px;
-            color: rgba(255, 255, 255, 0.55);
-            margin-top: 1px;
+        .pp-menu-item.active {
+            color: #f59e0b;
+            font-weight: 600;
         }
-        .potplayer-menu-divider {
-            height: 1px;
-            background: rgba(255, 255, 255, 0.1);
-            margin: 4px 6px;
+        .pp-menu-tag {
+            font-size: 10px;
+            color: #6b7280;
+            font-family: ui-monospace, monospace;
         }
 
-        /* High Visibility Seekbar Buffer Glowing Bar */
+        .pp-menu-divider {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.08);
+            margin: 3px 4px;
+        }
+
+        /* Refined glowing seekbar buffer track */
         .mdl-slider-background-upper {
-            background: linear-gradient(90deg, rgba(255, 179, 0, 0.45), rgba(255, 215, 0, 0.65)) !important;
-            box-shadow: 0 0 8px rgba(255, 193, 7, 0.4) !important;
-            border-radius: 3px !important;
+            background: rgba(245, 158, 11, 0.45) !important;
+            border-radius: 2px !important;
             height: 100% !important;
             opacity: 1 !important;
             display: block !important;
         }
 
-        @media (max-width: 768px) {
-            .potplayer-badge-codec,
-            .potplayer-badge-audio {
+        @media (max-width: 680px) {
+            .pp-codec,
+            .pp-audio {
                 display: none !important;
             }
         }
     `;
-    if (!document.getElementById('potplayer-hud-style')) {
+    if (!document.getElementById('potplayer-minimal-style')) {
         document.head.appendChild(hudStyle);
     }
 
-    let cachedSessionInfo = {
-        playMethod: 'DirectPlay',
+    let cachedSession = {
+        playMethod: 'DirectStream',
         videoCodec: 'H264',
-        audioCodec: 'AAC 2.0',
+        audioCodec: 'AAC',
+        audioChannels: '2.0',
         lastFetch: 0
     };
 
-    async function fetchSessionInfo() {
+    async function fetchSession() {
         const now = Date.now();
-        if (now - cachedSessionInfo.lastFetch < 3000) return;
-        cachedSessionInfo.lastFetch = now;
+        if (now - cachedSession.lastFetch < 3000) return;
+        cachedSession.lastFetch = now;
         try {
             if (window.ApiClient) {
                 const deviceId = window.ApiClient.deviceId ? window.ApiClient.deviceId() : '';
@@ -348,25 +446,23 @@
                 if (s && s.NowPlayingItem) {
                     const isTranscode = s.PlayState?.PlayMethod === 'Transcode';
                     const isDirectStream = s.PlayState?.PlayMethod === 'DirectStream';
-                    cachedSessionInfo.playMethod = isTranscode ? 'Transcode' : (isDirectStream ? 'DirectStream' : 'DirectPlay');
+                    cachedSession.playMethod = isTranscode ? 'Transcode' : (isDirectStream ? 'DirectStream' : 'DirectPlay');
+
+                    if (s.NowPlayingItem.MediaSources && s.NowPlayingItem.MediaSources[0]?.Bitrate) {
+                        effectiveBitrateBps = s.NowPlayingItem.MediaSources[0].Bitrate;
+                    }
 
                     if (s.TranscodingInfo) {
-                        cachedSessionInfo.videoCodec = (s.TranscodingInfo.VideoCodec || 'H264').toUpperCase();
-                        let a = (s.TranscodingInfo.AudioCodec || 'AAC').toUpperCase();
-                        if (s.TranscodingInfo.AudioChannels) {
-                            a += ' ' + (s.TranscodingInfo.AudioChannels === 6 ? '5.1' : s.TranscodingInfo.AudioChannels + '.0');
-                        }
-                        cachedSessionInfo.audioCodec = a;
+                        cachedSession.videoCodec = (s.TranscodingInfo.VideoCodec || 'H264').toUpperCase();
+                        cachedSession.audioCodec = (s.TranscodingInfo.AudioCodec || 'AAC').toUpperCase();
+                        cachedSession.audioChannels = s.TranscodingInfo.AudioChannels === 6 ? '5.1' : (s.TranscodingInfo.AudioChannels ? s.TranscodingInfo.AudioChannels + '.0' : '2.0');
                     } else if (s.NowPlayingItem.MediaStreams) {
                         const vs = s.NowPlayingItem.MediaStreams.find(m => m.Type === 'Video');
                         const as = s.NowPlayingItem.MediaStreams.find(m => m.Type === 'Audio');
-                        if (vs && vs.Codec) cachedSessionInfo.videoCodec = vs.Codec.toUpperCase();
+                        if (vs && vs.Codec) cachedSession.videoCodec = vs.Codec.toUpperCase();
                         if (as && as.Codec) {
-                            let a = as.Codec.toUpperCase();
-                            if (as.Channels) {
-                                a += ' ' + (as.Channels === 6 ? '5.1' : as.Channels + '.0');
-                            }
-                            cachedSessionInfo.audioCodec = a;
+                            cachedSession.audioCodec = as.Codec.toUpperCase();
+                            cachedSession.audioChannels = as.Channels === 6 ? '5.1' : (as.Channels ? as.Channels + '.0' : '2.0');
                         }
                     }
                 }
@@ -379,32 +475,36 @@
             return (bps / 1048576).toFixed(1) + ' MB/s';
         } else if (bps >= 1024) {
             return Math.round(bps / 1024) + ' KB/s';
-        } else if (bps > 0) {
-            return Math.round(bps) + ' B/s';
         }
         return '0 KB/s';
     }
 
-    function switchDecodeMethod(mode) {
+    function switchPreset(action) {
         const pm = window.playbackManager;
         const player = pm ? (pm.getCurrentPlayer ? pm.getCurrentPlayer() : (pm._currentPlayer || window.__currentVideoPlayer)) : null;
 
-        if (mode === 'direct') {
+        if (action === 'direct') {
+            forceDirectPlayNative = false;
             if (pm && pm.setMaxStreamingBitrate && player) {
                 pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 0 }, player);
             } else {
                 const sBtn = document.querySelector('.btnVideoOsdSettings');
                 if (sBtn) sBtn.click();
             }
-        } else if (mode === 'transcode-1080p') {
+        } else if (action === 'native-mp4') {
+            forceDirectPlayNative = true;
+            if (pm && pm.setMaxStreamingBitrate && player) {
+                pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 0 }, player);
+            }
+        } else if (action === 'transcode-1080p') {
             if (pm && pm.setMaxStreamingBitrate && player) {
                 pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 10000000 }, player);
             }
-        } else if (mode === 'transcode-720p') {
+        } else if (action === 'transcode-720p') {
             if (pm && pm.setMaxStreamingBitrate && player) {
                 pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 4000000 }, player);
             }
-        } else if (mode === 'stats') {
+        } else if (action === 'stats') {
             const sBtn = document.querySelector('.btnVideoOsdSettings');
             if (sBtn) {
                 sBtn.click();
@@ -415,79 +515,68 @@
                 }, 120);
             }
         }
-        closeDecodeMenu();
+        closeMenu();
     }
 
-    function closeDecodeMenu() {
-        const menu = document.getElementById('potplayerDecodeMenu');
-        if (menu) menu.remove();
+    function closeMenu() {
+        const m = document.getElementById('ppDecodeMenu');
+        if (m) m.remove();
     }
 
-    function toggleDecodeMenu(targetBtn) {
-        const existing = document.getElementById('potplayerDecodeMenu');
+    function toggleMenu(targetBtn) {
+        const existing = document.getElementById('ppDecodeMenu');
         if (existing) {
             existing.remove();
             return;
         }
 
-        const isHw = cachedSessionInfo.playMethod === 'DirectPlay' || cachedSessionInfo.playMethod === 'DirectStream';
+        const isHw = cachedSession.playMethod === 'DirectPlay' || cachedSession.playMethod === 'DirectStream';
 
         const menu = document.createElement('div');
-        menu.id = 'potplayerDecodeMenu';
-        menu.className = 'potplayer-menu';
+        menu.id = 'ppDecodeMenu';
+        menu.className = 'pp-menu';
 
         menu.innerHTML = `
-            <div class="potplayer-menu-header">🎬 选择解码方案</div>
-            <div class="potplayer-menu-item ${isHw ? 'active' : ''}" data-action="direct">
-                <span class="potplayer-menu-icon">⚡</span>
-                <div>
-                    <div class="potplayer-menu-title">硬件加速直接播放 (H/W 原画)</div>
-                    <div class="potplayer-menu-desc">客户端 GPU 解码 · 原始画质 · 0 服务端损耗</div>
-                </div>
+            <div class="pp-menu-header">DECODE PRESET</div>
+            <div class="pp-menu-item ${isHw ? 'active' : ''}" data-action="direct">
+                <span>Direct Stream (H/W Copy)</span>
+                <span class="pp-menu-tag">FAST BUFFER</span>
             </div>
-            <div class="potplayer-menu-item ${!isHw ? 'active' : ''}" data-action="transcode-1080p">
-                <span class="potplayer-menu-icon">🔄</span>
-                <div>
-                    <div class="potplayer-menu-title">服务端兼容转码 (1080P · 10M)</div>
-                    <div class="potplayer-menu-desc">解决音画不同步与编码不兼容</div>
-                </div>
+            <div class="pp-menu-item" data-action="native-mp4">
+                <span>Direct Play (Native MP4)</span>
+                <span class="pp-menu-tag">RAW</span>
             </div>
-            <div class="potplayer-menu-item" data-action="transcode-720p">
-                <span class="potplayer-menu-icon">📱</span>
-                <div>
-                    <div class="potplayer-menu-title">轻量省流转码 (720P · 4M)</div>
-                    <div class="potplayer-menu-desc">适合弱网、移动流量或远距离访问</div>
-                </div>
+            <div class="pp-menu-item ${!isHw ? 'active' : ''}" data-action="transcode-1080p">
+                <span>Transcode 1080p (S/W)</span>
+                <span class="pp-menu-tag">10M</span>
             </div>
-            <div class="potplayer-menu-divider"></div>
-            <div class="potplayer-menu-item" data-action="stats">
-                <span class="potplayer-menu-icon">📊</span>
-                <div>
-                    <div class="potplayer-menu-title">查看完整播放与解码统计 (Stats)</div>
-                    <div class="potplayer-menu-desc">码率、丢帧数、服务端与音频详情</div>
-                </div>
+            <div class="pp-menu-item" data-action="transcode-720p">
+                <span>Transcode 720p (S/W)</span>
+                <span class="pp-menu-tag">4M</span>
+            </div>
+            <div class="pp-menu-divider"></div>
+            <div class="pp-menu-item" data-action="stats">
+                <span>Playback Info</span>
+                <span class="pp-menu-tag">STATS</span>
             </div>
         `;
 
-        menu.querySelectorAll('.potplayer-menu-item').forEach(item => {
+        menu.querySelectorAll('.pp-menu-item').forEach(item => {
             item.addEventListener('click', (e) => {
                 e.stopPropagation();
-                const action = item.getAttribute('data-action');
-                switchDecodeMethod(action);
+                switchPreset(item.getAttribute('data-action'));
             });
         });
 
-        // Position menu above button
         const rect = targetBtn.getBoundingClientRect();
-        menu.style.left = `${Math.max(10, rect.left - 20)}px`;
-        menu.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+        menu.style.left = `${Math.max(10, rect.left - 10)}px`;
+        menu.style.bottom = `${window.innerHeight - rect.top + 6}px`;
 
         document.body.appendChild(menu);
 
-        // Click outside listener
         const onDocClick = (e) => {
             if (!menu.contains(e.target) && e.target !== targetBtn && !targetBtn.contains(e.target)) {
-                closeDecodeMenu();
+                closeMenu();
                 document.removeEventListener('click', onDocClick, true);
             }
         };
@@ -496,11 +585,11 @@
         }, 50);
     }
 
-    // Main HUD injection & update loop
-    function updatePotPlayerHud() {
+    // Main HUD update loop
+    function updateHud() {
         const osdControls = document.querySelector('.videoOsdBottom-maincontrols .buttons');
         if (!osdControls) {
-            closeDecodeMenu();
+            closeMenu();
             return;
         }
 
@@ -513,36 +602,27 @@
             hud.id = 'potplayerHud';
             hud.className = 'potplayer-hud';
             hud.innerHTML = `
-                <button type="button" class="potplayer-badge potplayer-badge-hw" id="potplayerHwBtn" title="点击切换解码方案 (硬解直出 / 服务端转码)">
-                    <span id="potplayerHwText">⚡ H/W 直出</span>
+                <button type="button" class="pp-badge pp-hw" id="ppHwBtn" title="Decode Preset (Click to switch)">H/W</button>
+                <span class="pp-badge pp-codec" id="ppVideoCodec">H264</span>
+                <button type="button" class="pp-badge pp-audio" id="ppAudioBtn" title="Audio Stream (Click to change track)">
+                    <span id="ppAudioCodec">AAC</span>
+                    <span id="ppAudioChannels" class="pp-dim">2.0</span>
                 </button>
-                <span class="potplayer-badge potplayer-badge-codec" id="potplayerVideoCodec" title="当前视频编码">AVC1</span>
-                <button type="button" class="potplayer-badge potplayer-badge-audio" id="potplayerAudioBtn" title="当前音频编码与声道 (点击切换音轨)">
-                    <span id="potplayerAudioText">AAC 2.0</span>
-                </button>
-                <div class="potplayer-badge potplayer-badge-speed potplayer-speed-idle" id="potplayerSpeedBadge" title="实时网络下载吞吐速率 (夸克88VIP拉取速度)">
-                    <span class="potplayer-speed-icon">⚡</span>
-                    <span id="potplayerSpeedText">0 KB/s</span>
-                </div>
-                <div class="potplayer-badge potplayer-badge-buffer" id="potplayerBufferBadge" title="全集预读缓冲进度与提前量">
-                    <span class="potplayer-buffer-icon">💾</span>
-                    <span id="potplayerBufferText">缓冲 0%</span>
-                </div>
+                <span class="pp-badge pp-speed" id="ppSpeedBadge">0 KB/s</span>
+                <span class="pp-badge pp-buffer" id="ppBufferBadge">BUFFER 0%</span>
             `;
 
-            // Insert immediately after timeText
             timeText.insertAdjacentElement('afterend', hud);
 
-            // Bind events
-            const hwBtn = hud.querySelector('#potplayerHwBtn');
+            const hwBtn = hud.querySelector('#ppHwBtn');
             if (hwBtn) {
                 hwBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    toggleDecodeMenu(hwBtn);
+                    toggleMenu(hwBtn);
                 });
             }
 
-            const audioBtn = hud.querySelector('#potplayerAudioBtn');
+            const audioBtn = hud.querySelector('#ppAudioBtn');
             if (audioBtn) {
                 audioBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -557,104 +637,97 @@
             }
         }
 
-        // 1. Calculate Realtime Network Speed
+        // 1. Calculate Realtime Network Speed with smoothing
         const now = Date.now();
-        const elapsed = (now - windowStartTime) / 1000;
-        if (elapsed >= 0.5) {
-            if (bytesInWindow > 0) {
-                currentSpeedBps = bytesInWindow / elapsed;
-                bytesInWindow = 0;
-            } else if (now - lastChunkDownloadedTime > 1800) {
-                currentSpeedBps = 0;
-            }
-            windowStartTime = now;
+        if (now - lastChunkDownloadedTime > 1800) {
+            instantSpeedBps = 0;
         }
+        smoothedSpeedBps = smoothedSpeedBps * 0.35 + instantSpeedBps * 0.65;
+        if (smoothedSpeedBps < 1024) smoothedSpeedBps = 0;
 
-        // 2. Calculate Buffer Progress
+        // 2. Calculate Buffer Percentage
         const video = document.querySelector('video');
         let bufferPercent = 0;
-        let aheadStr = '+0s';
         let isBufferFull = false;
 
         if (video && video.duration && !isNaN(video.duration) && video.duration > 0) {
             const ct = video.currentTime || 0;
-            let forwardBuffer = 0;
-            let totalBufferedEnd = 0;
+            let totalEnd = 0;
 
             for (let i = 0; i < video.buffered.length; i++) {
-                const start = video.buffered.start(i);
+                const s = video.buffered.start(i);
                 const end = video.buffered.end(i);
-                if (ct >= start && ct <= end) {
-                    forwardBuffer = end - ct;
-                }
-                if (end > totalBufferedEnd) {
-                    totalBufferedEnd = end;
+                if (ct >= s - 1 && ct <= end + 1) {
+                    totalEnd = Math.max(totalEnd, end);
+                } else if (end > totalEnd) {
+                    totalEnd = end;
                 }
             }
 
-            bufferPercent = Math.min(100, Math.round((totalBufferedEnd / video.duration) * 100));
-            const aheadMins = Math.floor(forwardBuffer / 60);
-            const aheadSecs = Math.floor(forwardBuffer % 60);
-            aheadStr = aheadMins > 0 ? `+${aheadMins}m` : `+${aheadSecs}s`;
+            bufferPercent = Math.min(100, Math.round((totalEnd / video.duration) * 100));
             isBufferFull = bufferPercent >= 99;
+
+            // Keep loading active when paused
+            if (video.paused && activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
+                activeHlsInstance.startLoad();
+            }
         }
 
-        // Update Speed Display
-        const speedBadge = hud.querySelector('#potplayerSpeedBadge');
-        const speedText = hud.querySelector('#potplayerSpeedText');
-        if (speedBadge && speedText) {
-            speedBadge.className = 'potplayer-badge potplayer-badge-speed';
-            if (isBufferFull && currentSpeedBps === 0) {
-                speedText.textContent = '满速已就绪';
-                speedBadge.classList.add('potplayer-speed-fast');
+        // Update Speed Badge
+        const speedBadge = hud.querySelector('#ppSpeedBadge');
+        if (speedBadge) {
+            speedBadge.className = 'pp-badge pp-speed';
+            if (isBufferFull && smoothedSpeedBps === 0) {
+                speedBadge.textContent = 'IDLE';
+                speedBadge.classList.add('pp-speed-fast');
             } else {
-                speedText.textContent = formatSpeed(currentSpeedBps);
-                if (currentSpeedBps >= 3 * 1048576) {
-                    speedBadge.classList.add('potplayer-speed-fast'); // > 3MB/s, 88VIP high-speed green
-                } else if (currentSpeedBps >= 512 * 1024) {
-                    speedBadge.classList.add('potplayer-speed-normal'); // 500KB - 3MB/s
-                } else if (currentSpeedBps > 0) {
-                    speedBadge.classList.add('potplayer-speed-slow');
-                } else {
-                    speedBadge.classList.add('potplayer-speed-idle');
+                speedBadge.textContent = formatSpeed(smoothedSpeedBps);
+                if (smoothedSpeedBps >= 3 * 1048576) {
+                    speedBadge.classList.add('pp-speed-fast');
+                } else if (smoothedSpeedBps >= 512 * 1024) {
+                    speedBadge.classList.add('pp-speed-normal');
+                } else if (smoothedSpeedBps > 0) {
+                    speedBadge.classList.add('pp-speed-slow');
                 }
             }
         }
 
-        // Update Buffer Display
-        const bufferBadge = hud.querySelector('#potplayerBufferBadge');
-        const bufferText = hud.querySelector('#potplayerBufferText');
-        if (bufferBadge && bufferText) {
+        // Update Buffer Badge
+        const bufferBadge = hud.querySelector('#ppBufferBadge');
+        if (bufferBadge) {
+            bufferBadge.className = 'pp-badge pp-buffer';
             if (isBufferFull) {
-                bufferText.textContent = '缓冲 100% (全集已满)';
-                bufferBadge.classList.add('potplayer-buffer-full');
+                bufferBadge.textContent = 'BUFFER 100%';
+                bufferBadge.classList.add('pp-buffer-full');
             } else {
-                bufferText.textContent = `缓冲 ${bufferPercent}% (${aheadStr})`;
-                bufferBadge.classList.remove('potplayer-buffer-full');
+                bufferBadge.textContent = `BUFFER ${bufferPercent}%`;
             }
         }
 
-        // Update Decode & Codec Badges
-        fetchSessionInfo();
-        const hwBtn = hud.querySelector('#potplayerHwBtn');
-        const hwText = hud.querySelector('#potplayerHwText');
-        const videoCodecEl = hud.querySelector('#potplayerVideoCodec');
-        const audioText = hud.querySelector('#potplayerAudioText');
+        // Update Codecs & Decode Mode
+        fetchSession();
+        const hwBtn = hud.querySelector('#ppHwBtn');
+        const videoCodecEl = hud.querySelector('#ppVideoCodec');
+        const audioCodecEl = hud.querySelector('#ppAudioCodec');
+        const audioChanEl = hud.querySelector('#ppAudioChannels');
 
-        const isHw = cachedSessionInfo.playMethod === 'DirectPlay' || cachedSessionInfo.playMethod === 'DirectStream';
-        if (hwBtn && hwText) {
-            hwBtn.className = isHw ? 'potplayer-badge potplayer-badge-hw' : 'potplayer-badge potplayer-badge-sw';
-            hwText.textContent = isHw ? '⚡ H/W 直出' : '🔄 S/W 转码';
+        const isHw = cachedSession.playMethod === 'DirectPlay' || cachedSession.playMethod === 'DirectStream';
+        if (hwBtn) {
+            hwBtn.className = isHw ? 'pp-badge pp-hw' : 'pp-badge pp-sw';
+            hwBtn.textContent = isHw ? 'H/W' : 'S/W';
         }
         if (videoCodecEl) {
-            videoCodecEl.textContent = cachedSessionInfo.videoCodec || 'AVC1';
+            videoCodecEl.textContent = cachedSession.videoCodec || 'H264';
         }
-        if (audioText) {
-            audioText.textContent = cachedSessionInfo.audioCodec || 'AAC 2.0';
+        if (audioCodecEl) {
+            audioCodecEl.textContent = cachedSession.audioCodec || 'AAC';
+        }
+        if (audioChanEl) {
+            audioChanEl.textContent = cachedSession.audioChannels || '2.0';
         }
     }
 
-    setInterval(updatePotPlayerHud, 500);
+    setInterval(updateHud, 350);
 
     // =========================================================================
     // 3. Persistent "最近观看" (Recently Watched) Home Section
@@ -730,7 +803,6 @@
 
             if (!items.length) return;
 
-            // Fetch parent names for series context
             const parentIds = [...new Set(items.map(it => it.ParentId).filter(Boolean))];
             const parentMap = {};
             if (parentIds.length && window.ApiClient.getItem) {

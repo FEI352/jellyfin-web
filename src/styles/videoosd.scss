@@ -355,113 +355,107 @@
     }
 }
 
-/* PotPlayer-Style HUD Control Bar */
+/* Minimalist PotPlayer-Style HUD Control Bar */
 .videoOsdBottom-maincontrols .buttons .osdTimeText {
-    margin-right: 0.6em !important;
+    margin-right: 0.8em !important;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
+    font-size: 12px !important;
 }
 
 .potplayer-hud {
     display: inline-flex !important;
     align-items: center !important;
-    gap: 6px !important;
-    margin-left: 0.8em !important;
+    gap: 4px !important;
     margin-right: auto !important;
     user-select: none !important;
     z-index: 100 !important;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
 }
 
-.potplayer-badge {
+.pp-badge {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    height: 24px;
-    padding: 0 8px;
-    border-radius: 4px;
+    justify-content: center;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 3px;
     font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.3px;
-    background: rgba(30, 30, 30, 0.85);
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    color: #e0e0e0;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    font-weight: 500;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    background: rgba(18, 18, 22, 0.75);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: #d1d5db;
+    transition: all 0.15s ease;
     white-space: nowrap;
+    font-variant-numeric: tabular-nums;
 }
 
-button.potplayer-badge {
+button.pp-badge {
     cursor: pointer;
     outline: none;
 }
-button.potplayer-badge:hover {
-    background: rgba(50, 50, 50, 0.95);
-    border-color: rgba(255, 255, 255, 0.35);
-    transform: translateY(-1px);
+button.pp-badge:hover {
+    background: rgba(35, 35, 42, 0.95);
+    border-color: rgba(255, 255, 255, 0.3);
 }
 
-.potplayer-badge-hw {
-    background: rgba(45, 32, 10, 0.9) !important;
-    border: 1px solid rgba(255, 179, 0, 0.6) !important;
-    color: #ffb300 !important;
+.pp-hw {
+    color: #f59e0b !important;
+    border-color: rgba(245, 158, 11, 0.35) !important;
+    background: rgba(30, 24, 12, 0.8) !important;
 }
-.potplayer-badge-hw:hover {
-    background: rgba(65, 48, 15, 0.95) !important;
-    box-shadow: 0 0 10px rgba(255, 179, 0, 0.45) !important;
-}
-
-.potplayer-badge-sw {
-    background: rgba(10, 38, 48, 0.9) !important;
-    border: 1px solid rgba(0, 229, 255, 0.6) !important;
-    color: #00e5ff !important;
-}
-.potplayer-badge-sw:hover {
-    background: rgba(15, 55, 70, 0.95) !important;
-    box-shadow: 0 0 10px rgba(0, 229, 255, 0.45) !important;
+.pp-hw:hover {
+    background: rgba(45, 34, 15, 0.95) !important;
+    border-color: #f59e0b !important;
 }
 
-.potplayer-badge-codec {
-    color: #ffffff !important;
-    background: rgba(25, 25, 28, 0.85) !important;
+.pp-sw {
+    color: #38bdf8 !important;
+    border-color: rgba(56, 189, 248, 0.35) !important;
+    background: rgba(12, 26, 36, 0.8) !important;
 }
-.potplayer-badge-audio {
-    color: #b0bec5 !important;
-    background: rgba(25, 25, 28, 0.85) !important;
-}
-
-.potplayer-badge-speed {
-    font-variant-numeric: tabular-nums;
-    min-width: 78px;
-    justify-content: center;
-}
-.potplayer-speed-fast {
-    color: #00e676 !important;
-    border-color: rgba(0, 230, 118, 0.5) !important;
-    background: rgba(0, 50, 20, 0.6) !important;
-}
-.potplayer-speed-normal {
-    color: #ffb300 !important;
-    border-color: rgba(255, 179, 0, 0.4) !important;
-}
-.potplayer-speed-slow {
-    color: #ff9100 !important;
-    border-color: rgba(255, 145, 0, 0.4) !important;
-}
-.potplayer-speed-idle {
-    color: rgba(255, 255, 255, 0.4) !important;
+.pp-sw:hover {
+    background: rgba(16, 38, 52, 0.95) !important;
+    border-color: #38bdf8 !important;
 }
 
-.potplayer-badge-buffer {
-    font-variant-numeric: tabular-nums;
+.pp-codec,
+.pp-audio {
+    color: #9ca3af;
 }
-.potplayer-buffer-full {
-    color: #00e676 !important;
-    border-color: rgba(0, 230, 118, 0.5) !important;
+.pp-dim {
+    opacity: 0.65;
+    margin-left: 2px;
 }
 
-/* PotPlayer glowing seekbar buffer track */
+.pp-speed {
+    min-width: 62px;
+    color: #6b7280;
+}
+.pp-speed-fast {
+    color: #22c55e !important;
+    border-color: rgba(34, 197, 94, 0.35) !important;
+}
+.pp-speed-normal {
+    color: #f59e0b !important;
+}
+.pp-speed-slow {
+    color: #38bdf8 !important;
+}
+
+.pp-buffer {
+    min-width: 76px;
+    color: #9ca3af;
+}
+.pp-buffer-full {
+    color: #22c55e !important;
+    border-color: rgba(34, 197, 94, 0.35) !important;
+}
+
 .mdl-slider-background-upper {
-    background: linear-gradient(90deg, rgba(255, 179, 0, 0.45), rgba(255, 215, 0, 0.65)) !important;
-    box-shadow: 0 0 8px rgba(255, 193, 7, 0.4) !important;
-    border-radius: 3px !important;
+    background: rgba(245, 158, 11, 0.45) !important;
+    border-radius: 2px !important;
     height: 100% !important;
     opacity: 1 !important;
     display: block !important;

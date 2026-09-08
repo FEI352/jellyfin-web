@@ -17,6 +17,8 @@
             HlsClass.DefaultConfig.backBufferLength = 1800; // 30 minutes back buffer
             HlsClass.DefaultConfig.maxBufferHole = 0.5;
             HlsClass.DefaultConfig.lowLatencyMode = false;
+            HlsClass.DefaultConfig.startFragPrefetch = true;
+            HlsClass.DefaultConfig.progressive = true;
         }
     }
 
@@ -30,6 +32,8 @@
             userConfig.backBufferLength = 1800;
             userConfig.maxBufferHole = 0.5;
             userConfig.lowLatencyMode = false;
+            userConfig.startFragPrefetch = true;
+            userConfig.progressive = true;
             userConfig.manifestLoadingTimeOut = 30000;
             console.log('[PotPlayer-Buffer] Instantiating Hls with continuous full episode buffer (7200s, 2GB)');
             return new OriginalHls(userConfig);

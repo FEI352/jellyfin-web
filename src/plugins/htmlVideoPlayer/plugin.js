@@ -573,6 +573,8 @@ export class HtmlVideoPlayer {
                     maxBufferHole: 0.5,
                     highBufferWatchdogPeriod: 2,
                     lowLatencyMode: false,
+                    startFragPrefetch: true,
+                    progressive: true,
                     videoPreference: { preferHDR: true },
                     xhrSetup(xhr) {
                         xhr.withCredentials = includeCorsCredentials;

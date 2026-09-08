@@ -82,8 +82,8 @@
         };
     }
 
-    // Configure HLS Player for 7200s (2hr) / 2GB continuous prebuffering
-    function applyHlsBufferConfig(HlsClass) {
+    // Configure HLS Player for 7200s (2hr) / 2GB continuous prebuffering without breaking constructor or static Events
+    function configureHls(HlsClass) {
         if (!HlsClass) return;
         if (HlsClass.DefaultConfig) {
             HlsClass.DefaultConfig.maxBufferLength = 7200; // 2 hours buffer ahead
@@ -94,77 +94,93 @@
             HlsClass.DefaultConfig.lowLatencyMode = false;
             HlsClass.DefaultConfig.startFragPrefetch = true;
             HlsClass.DefaultConfig.progressive = true;
+            HlsClass.DefaultConfig.manifestLoadingTimeOut = 30000;
         }
-    }
 
-    function wrapHlsConstructor(OriginalHls) {
-        if (!OriginalHls || OriginalHls.__potplayerWrapped) return OriginalHls;
-        function EnhancedHls(userConfig) {
-            userConfig = userConfig || {};
-            userConfig.maxBufferLength = 7200;
-            userConfig.maxMaxBufferLength = 14400;
-            userConfig.maxBufferSize = 2 * 1024 * 1024 * 1024;
-            userConfig.backBufferLength = 1800;
-            userConfig.maxBufferHole = 0.5;
-            userConfig.lowLatencyMode = false;
-            userConfig.startFragPrefetch = true;
-            userConfig.progressive = true;
-            userConfig.manifestLoadingTimeOut = 30000;
-            console.log('[PotPlayer-Buffer] Instantiating Hls with continuous full episode buffer (7200s, 2GB)');
-            const inst = new OriginalHls(userConfig);
-            activeHlsInstance = inst;
-            window.__potplayer_active_hls = inst;
+        if (HlsClass.prototype && !HlsClass.prototype.__potplayerHooked) {
+            HlsClass.prototype.__potplayerHooked = true;
+            const origLoadSource = HlsClass.prototype.loadSource;
+            HlsClass.prototype.loadSource = function(url) {
+                activeHlsInstance = this;
+                window.__potplayer_active_hls = this;
 
-            // Hook fragment progress & load events for realtime speed monitoring
-            if (OriginalHls.Events) {
-                if (OriginalHls.Events.FRAG_LOAD_PROGRESS) {
-                    inst.on(OriginalHls.Events.FRAG_LOAD_PROGRESS, (event, data) => {
-                        const now = Date.now();
-                        lastChunkDownloadedTime = now;
-                        if (inst.bandwidthEstimate && inst.bandwidthEstimate > 0) {
-                            instantSpeedBps = inst.bandwidthEstimate / 8;
-                        }
-                    });
+                // Force PotPlayer 7200s buffer directly onto the instantiated player config
+                if (this.config) {
+                    this.config.maxBufferLength = 7200;
+                    this.config.maxMaxBufferLength = 14400;
+                    this.config.maxBufferSize = 2 * 1024 * 1024 * 1024;
+                    this.config.backBufferLength = 1800;
+                    this.config.startFragPrefetch = true;
+                    this.config.progressive = true;
+                    this.config.lowLatencyMode = false;
+                    this.config.manifestLoadingTimeOut = 30000;
                 }
-                if (OriginalHls.Events.FRAG_LOADED) {
-                    inst.on(OriginalHls.Events.FRAG_LOADED, (event, data) => {
-                        const now = Date.now();
-                        lastChunkDownloadedTime = now;
-                        if (data && data.stats) {
-                            const bytes = data.stats.total || data.stats.loaded || 0;
-                            const dur = (data.stats.loading.end - data.stats.loading.start) / 1000;
-                            if (dur > 0 && bytes > 0) {
-                                instantSpeedBps = bytes / dur;
-                            } else if (inst.bandwidthEstimate) {
-                                instantSpeedBps = inst.bandwidthEstimate / 8;
+
+                // Hook fragment progress & load events for realtime speed monitoring
+                if (HlsClass.Events) {
+                    if (HlsClass.Events.FRAG_LOAD_PROGRESS) {
+                        this.on(HlsClass.Events.FRAG_LOAD_PROGRESS, (event, data) => {
+                            const now = Date.now();
+                            lastChunkDownloadedTime = now;
+                            if (this.bandwidthEstimate && this.bandwidthEstimate > 0) {
+                                instantSpeedBps = this.bandwidthEstimate / 8;
                             }
-                        }
-                    });
+                        });
+                    }
+                    if (HlsClass.Events.FRAG_LOADED) {
+                        this.on(HlsClass.Events.FRAG_LOADED, (event, data) => {
+                            const now = Date.now();
+                            lastChunkDownloadedTime = now;
+                            if (data && data.stats) {
+                                const bytes = data.stats.total || data.stats.loaded || 0;
+                                const dur = (data.stats.loading.end - data.stats.loading.start) / 1000;
+                                if (dur > 0 && bytes > 0) {
+                                    instantSpeedBps = bytes / dur;
+                                } else if (this.bandwidthEstimate) {
+                                    instantSpeedBps = this.bandwidthEstimate / 8;
+                                }
+                            }
+                        });
+                    }
+                    if (HlsClass.Events.ERROR) {
+                        this.on(HlsClass.Events.ERROR, (event, data) => {
+                            if (data && data.fatal) {
+                                console.warn("[PotPlayer-Buffer] Fatal HLS error:", data.type, data.details);
+                                switch (data.type) {
+                                    case HlsClass.ErrorTypes.NETWORK_ERROR:
+                                        this.startLoad(-1);
+                                        break;
+                                    case HlsClass.ErrorTypes.MEDIA_ERROR:
+                                        this.recoverMediaError();
+                                        break;
+                                    default:
+                                        console.warn("[PotPlayer-Buffer] Unrecoverable error, switching to native DirectPlay fallback");
+                                        forceDirectPlayNative = true;
+                                        break;
+                                }
+                            }
+                        });
+                    }
                 }
-            }
-            return inst;
+                return origLoadSource.apply(this, arguments);
+            };
         }
-        EnhancedHls.prototype = OriginalHls.prototype;
-        Object.assign(EnhancedHls, OriginalHls);
-        EnhancedHls.DefaultConfig = OriginalHls.DefaultConfig;
-        applyHlsBufferConfig(EnhancedHls);
-        EnhancedHls.__potplayerWrapped = true;
-        return EnhancedHls;
     }
 
-    let _hls = window.Hls ? wrapHlsConstructor(window.Hls) : null;
+    let _hls = window.Hls ? (configureHls(window.Hls), window.Hls) : null;
     try {
-        Object.defineProperty(window, 'Hls', {
+        Object.defineProperty(window, "Hls", {
             get() { return _hls; },
             set(val) {
-                _hls = wrapHlsConstructor(val);
-                console.log('[PotPlayer-Buffer] window.Hls hooked successfully.');
+                _hls = val;
+                configureHls(val);
+                console.log("[PotPlayer-Buffer] window.Hls safely configured with continuous buffer & metrics.");
             },
             configurable: true
         });
     } catch (e) {
         if (window.Hls) {
-            window.Hls = wrapHlsConstructor(window.Hls);
+            configureHls(window.Hls);
         }
     }
 
@@ -445,8 +461,8 @@
                 const s = sessions && sessions.find(item => (deviceId && item.DeviceId === deviceId) || item.NowPlayingItem);
                 if (s && s.NowPlayingItem) {
                     const isTranscode = s.PlayState?.PlayMethod === 'Transcode';
-                    const isDirectStream = s.PlayState?.PlayMethod === 'DirectStream';
-                    cachedSession.playMethod = isTranscode ? 'Transcode' : (isDirectStream ? 'DirectStream' : 'DirectPlay');
+                    const isDirectStream = s.PlayState?.PlayMethod === 'DirectStream' || (s.TranscodingInfo && s.TranscodingInfo.IsVideoDirect);
+                    cachedSession.playMethod = (isTranscode && !s.TranscodingInfo?.IsVideoDirect) ? 'Transcode' : (isDirectStream ? 'DirectStream' : 'DirectPlay');
 
                     if (s.NowPlayingItem.MediaSources && s.NowPlayingItem.MediaSources[0]?.Bitrate) {
                         effectiveBitrateBps = s.NowPlayingItem.MediaSources[0].Bitrate;

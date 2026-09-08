@@ -746,53 +746,225 @@
     setInterval(updateHud, 350);
 
     // =========================================================================
-    // 3. Persistent "最近观看" (Recently Watched) Home Section
+    // 3. Persistent & Comprehensive "最近观看" (Recently Watched) Home Section
     // =========================================================================
-    function formatTimeAgo(isoString) {
-        if (!isoString) return '';
-        try {
-            const date = new Date(isoString);
-            const now = new Date();
-            const diffSec = Math.floor((now - date) / 1000);
-            if (diffSec < 60) return '刚刚';
-            if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`;
-            if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`;
-            if (diffSec < 2592000) return `${Math.floor(diffSec / 86400)} 天前`;
-            return `${date.getMonth() + 1}月${date.getDate()}日`;
-        } catch (e) {
-            return '';
+    
+    // 1. Hide native incomplete Continue Watching (.section1) so our true chronological list takes its place
+    const recentGlobalStyle = document.createElement("style");
+    recentGlobalStyle.id = "potplayer-recent-watched-style";
+    recentGlobalStyle.textContent = `
+        /* Hide native section1 continue-watching which omits items watched under 5% or finished */
+        .homeSectionsContainer .section1,
+        .sections .section1,
+        .verticalSection.section1 {
+            display: none !important;
         }
+
+        .customRecentSection {
+            margin: 1.2em 0 1.6em 0 !important;
+            animation: ppRecentFadeIn 0.25s ease-out;
+        }
+
+        @keyframes ppRecentFadeIn {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .pp-recent-card {
+            width: 220px !important;
+            flex: 0 0 auto !important;
+            margin-right: 1.2em !important;
+            cursor: pointer !important;
+            position: relative !important;
+            border-radius: 8px !important;
+            overflow: hidden !important;
+            background: #141417 !important;
+            border: 1px solid rgba(255, 255, 255, 0.08) !important;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important;
+            transition: transform 0.2s cubic-bezier(0.2, 0, 0.2, 1), border-color 0.2s, box-shadow 0.2s !important;
+        }
+
+        .pp-recent-card:hover {
+            transform: scale(1.035) !important;
+            border-color: rgba(245, 158, 11, 0.5) !important;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6), 0 0 12px rgba(245, 158, 11, 0.2) !important;
+        }
+
+        .pp-recent-thumb {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16/9;
+            background: #0d0d10;
+            overflow: hidden;
+        }
+
+        .pp-recent-img {
+            position: absolute;
+            inset: 0;
+            background-size: cover;
+            background-position: center;
+            transition: transform 0.3s ease;
+        }
+
+        .pp-recent-card:hover .pp-recent-img {
+            transform: scale(1.05);
+        }
+
+        .pp-recent-playbtn {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.35);
+            opacity: 0;
+            transition: opacity 0.2s ease;
+        }
+
+        .pp-recent-card:hover .pp-recent-playbtn {
+            opacity: 1;
+        }
+
+        .pp-recent-playicon {
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: rgba(245, 158, 11, 0.9);
+            color: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+            transition: transform 0.15s ease;
+        }
+
+        .pp-recent-playicon:hover {
+            transform: scale(1.12);
+        }
+
+        .pp-recent-badge {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.2px;
+            font-variant-numeric: tabular-nums;
+            z-index: 2;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
+        }
+
+        .pp-badge-played {
+            background: rgba(34, 197, 94, 0.88);
+            color: #fff;
+        }
+
+        .pp-badge-progress {
+            background: rgba(14, 165, 233, 0.9);
+            color: #fff;
+        }
+
+        .pp-badge-just {
+            background: rgba(245, 158, 11, 0.88);
+            color: #000;
+        }
+
+        .pp-recent-progbar {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.16);
+            z-index: 2;
+        }
+
+        .pp-recent-progfill {
+            height: 100%;
+            background: #0ea5e9;
+            box-shadow: 0 0 6px rgba(14, 165, 233, 0.8);
+        }
+
+        .pp-recent-info {
+            padding: 9px 12px 11px 12px;
+        }
+
+        .pp-recent-title {
+            font-size: 13.5px;
+            font-weight: 600;
+            color: #f3f4f6;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            line-height: 1.35;
+        }
+
+        .pp-recent-subtitle {
+            font-size: 11.5px;
+            color: #9ca3af;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-top: 3px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+    `;
+    if (!document.getElementById("potplayer-recent-watched-style")) {
+        document.head.appendChild(recentGlobalStyle);
     }
 
-    function updateNativeTitles() {
-        document.querySelectorAll('.sectionTitle').forEach(el => {
-            const text = el.textContent.trim();
-            if (text === '继续观看') {
-                el.textContent = '最近观看';
+    // 2. Real-time playback progress recorder in localStorage
+    document.addEventListener("timeupdate", (e) => {
+        if (e.target && e.target.tagName === "VIDEO") {
+            const v = e.target;
+            if (!v.duration || isNaN(v.duration) || v.currentTime < 2) return;
+            const pm = window.playbackManager;
+            const curItem = pm && (pm.currentItem ? pm.currentItem() : pm._currentItem);
+            const itemId = (curItem && curItem.Id) || (window.location.hash.match(/id=([a-f0-9]+)/i)?.[1]);
+            if (itemId) {
+                try {
+                    const store = JSON.parse(localStorage.getItem("jf_recent_progress") || "{}");
+                    store[itemId] = {
+                        positionTicks: Math.round(v.currentTime * 10000000),
+                        currentTime: v.currentTime,
+                        duration: v.duration,
+                        percent: Math.min(100, Math.round((v.currentTime / v.duration) * 100)),
+                        time: Date.now()
+                    };
+                    localStorage.setItem("jf_recent_progress", JSON.stringify(store));
+                } catch (err) {}
             }
-        });
+        }
+    }, true);
+
+    function formatTimeAgo(isoString, localTimestamp) {
+        let ts = 0;
+        if (localTimestamp && localTimestamp > 0) {
+            ts = localTimestamp;
+        } else if (isoString) {
+            try { ts = new Date(isoString).getTime(); } catch (e) {}
+        }
+        if (!ts) return "";
+        const diffSec = Math.floor((Date.now() - ts) / 1000);
+        if (diffSec < 60) return "刚刚";
+        if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`;
+        if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`;
+        if (diffSec < 2592000) return `${Math.floor(diffSec / 86400)} 天前`;
+        const d = new Date(ts);
+        return `${d.getMonth() + 1}月${d.getDate()}日`;
     }
 
-    let isUpdating = false;
+    let isRecentUpdating = false;
+    let cachedParentMap = {};
 
-    async function checkRecentSection() {
-        if (isUpdating) return;
-        const hash = window.location.hash || '';
-        if (hash && !hash.startsWith('#/home') && hash !== '#/' && hash !== '') {
-            return;
-        }
-
-        updateNativeTitles();
-
-        // If native continue-watching section has visible cards, ensure its title is "最近观看"
-        const nativeSection = document.querySelector('.section1:not(.hide)');
-        if (nativeSection && nativeSection.querySelector('.card')) {
-            const customSec = document.getElementById('customRecentWatchedSection');
-            if (customSec) customSec.remove();
-            return;
-        }
-
-        if (document.getElementById('customRecentWatchedSection')) {
+    async function checkRecentSection(forceRefresh) {
+        if (isRecentUpdating) return;
+        const hash = window.location.hash || "";
+        if (hash && !hash.startsWith("#/home") && hash !== "#/" && hash !== "") {
             return;
         }
 
@@ -803,127 +975,178 @@
         const userId = window.ApiClient.getCurrentUserId();
         if (!userId) return;
 
-        isUpdating = true;
+        const homeContainer = document.querySelector(".homeSectionsContainer") || document.querySelector(".sections");
+        if (!homeContainer) return;
+
+        const existingSection = document.getElementById("customRecentWatchedSection");
+        if (existingSection && !forceRefresh) {
+            return;
+        }
+
+        isRecentUpdating = true;
         try {
+            // Read local real-time playback records
+            let localProgress = {};
+            try {
+                localProgress = JSON.parse(localStorage.getItem("jf_recent_progress") || "{}");
+            } catch (e) {}
+
+            // Fetch server DatePlayed items (chronological order of every episode/movie ever opened)
             const queryParams = {
-                SortBy: 'DatePlayed',
-                SortOrder: 'Descending',
+                SortBy: "DatePlayed",
+                SortOrder: "Descending",
                 Recursive: true,
-                IncludeItemTypes: 'Movie,Episode,Video',
-                Limit: 12,
-                fields: 'ParentId,SeriesName,PrimaryImageAspectRatio'
+                IncludeItemTypes: "Movie,Episode,Video",
+                Limit: 16,
+                fields: "ParentId,SeriesName,PrimaryImageAspectRatio,UserData,RunTimeTicks"
             };
 
             const result = await window.ApiClient.getItems(userId, queryParams);
             const items = (result && result.Items) ? result.Items.filter(it => it.UserData && it.UserData.LastPlayedDate) : [];
 
-            if (!items.length) return;
+            if (!items.length) {
+                if (existingSection) existingSection.remove();
+                return;
+            }
 
+            // Batch resolve parent names (e.g. series or folder titles)
             const parentIds = [...new Set(items.map(it => it.ParentId).filter(Boolean))];
-            const parentMap = {};
-            if (parentIds.length && window.ApiClient.getItem) {
-                await Promise.all(parentIds.map(async pid => {
+            const toFetch = parentIds.filter(pid => !cachedParentMap[pid]);
+            if (toFetch.length && window.ApiClient.getItem) {
+                await Promise.all(toFetch.map(async pid => {
                     try {
                         const p = await window.ApiClient.getItem(userId, pid);
-                        if (p && p.Name) parentMap[pid] = p.Name;
+                        if (p && p.Name) cachedParentMap[pid] = p.Name;
                     } catch (e) {}
                 }));
             }
 
-            const homeContainer = document.querySelector('.homeSectionsContainer') || document.querySelector('.sections');
-            if (!homeContainer) return;
-
-            const myMediaSection = homeContainer.querySelector('.section0') || homeContainer.firstElementChild;
-
-            const sectionEl = document.createElement('div');
-            sectionEl.id = 'customRecentWatchedSection';
-            sectionEl.className = 'verticalSection customRecentSection';
-            sectionEl.style.margin = '1.2em 0 1.5em 0';
-
-            let cardsHtml = '';
+            let cardsHtml = "";
             items.forEach(it => {
-                const parentName = parentMap[it.ParentId] || it.SeriesName || '';
-                const timeAgo = formatTimeAgo(it.UserData.LastPlayedDate);
-                const hasCover = it.ImageTags && it.ImageTags.Primary;
-                const imgUrl = hasCover ? window.ApiClient.getImageUrl(it.Id, {
-                    type: 'Primary',
-                    fillHeight: 320,
-                    fillWidth: 500,
-                    quality: 90
-                }) : '';
+                const parentName = cachedParentMap[it.ParentId] || it.SeriesName || "";
+                const local = localProgress[it.Id];
 
-                let statusBadge = '';
+                // Determine effective playback progress
                 let progressPercent = 0;
+                let statusBadge = "";
+
                 if (it.UserData.Played) {
-                    statusBadge = '<span style="background: rgba(46, 125, 50, 0.85); color: #fff; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500;">已看完</span>';
-                } else if (it.UserData.PlaybackPositionTicks && it.RunTimeTicks) {
-                    progressPercent = Math.min(100, Math.round((it.UserData.PlaybackPositionTicks / it.RunTimeTicks) * 100));
-                    statusBadge = `<span style="background: rgba(0, 164, 220, 0.85); color: #fff; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500;">看到 ${progressPercent}%</span>`;
+                    statusBadge = '<span class="pp-recent-badge pp-badge-played">已看完</span>';
+                } else {
+                    if (it.UserData.PlaybackPositionTicks && it.RunTimeTicks) {
+                        progressPercent = Math.min(100, Math.round((it.UserData.PlaybackPositionTicks / it.RunTimeTicks) * 100));
+                    }
+                    if (local && local.percent > progressPercent) {
+                        progressPercent = local.percent;
+                    }
+
+                    if (progressPercent >= 92) {
+                        statusBadge = '<span class="pp-recent-badge pp-badge-played">已看完</span>';
+                    } else if (progressPercent > 0) {
+                        statusBadge = `<span class="pp-recent-badge pp-badge-progress">看到 ${progressPercent}%</span>`;
+                    } else {
+                        statusBadge = '<span class="pp-recent-badge pp-badge-just">刚刚看过</span>';
+                    }
                 }
 
+                // Time ago
+                const timeAgo = formatTimeAgo(it.UserData.LastPlayedDate, local?.time);
+
+                // Image resolution hierarchy: Primary -> Thumb -> Backdrop -> Parent Primary
+                let imgUrl = "";
+                if (it.ImageTags && it.ImageTags.Primary) {
+                    imgUrl = window.ApiClient.getImageUrl(it.Id, { type: "Primary", fillHeight: 320, fillWidth: 500, quality: 90 });
+                } else if (it.ImageTags && it.ImageTags.Thumb) {
+                    imgUrl = window.ApiClient.getImageUrl(it.Id, { type: "Thumb", fillHeight: 320, fillWidth: 500, quality: 90 });
+                } else if (it.BackdropImageTags && it.BackdropImageTags.length) {
+                    imgUrl = window.ApiClient.getImageUrl(it.Id, { type: "Backdrop", fillHeight: 320, fillWidth: 500, quality: 90 });
+                } else if (it.ParentId) {
+                    imgUrl = window.ApiClient.getImageUrl(it.ParentId, { type: "Primary", fillHeight: 320, fillWidth: 500, quality: 90 });
+                }
+
+                // Format titles
+                const mainTitle = parentName ? parentName : it.Name;
+                const subTitle = parentName ? `${it.Name} · ${timeAgo}` : timeAgo;
+
                 cardsHtml += `
-                    <div class="card card-hoverable" style="width: 220px; flex: 0 0 auto; margin-right: 1.2em; cursor: pointer; transition: transform 0.2s;" onmouseover="this.style.transform='scale(1.03)'" onmouseout="this.style.transform='scale(1)'" onclick="window.location.hash='#/details?id=${it.Id}'">
-                        <div class="cardBox visualCardBox" style="background: #1b1c1e; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 14px rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.06);">
-                            <div class="cardScalable" style="position: relative; width: 100%; aspect-ratio: 16/9; background: #121214;">
-                                ${imgUrl ? `<div class="cardImage" style="position: absolute; inset: 0; background: url('${imgUrl}') center/cover no-repeat;"></div>` : '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#555;"><span class="material-icons" style="font-size:44px;">movie</span></div>'}
-                                <div style="position: absolute; top: 6px; right: 6px;">${statusBadge}</div>
-                                ${progressPercent > 0 ? `
-                                    <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: rgba(255,255,255,0.15);">
-                                        <div style="height: 100%; width: ${progressPercent}%; background: #00a4dc;"></div>
-                                    </div>
-                                ` : ''}
-                            </div>
-                            <div class="cardFooter" style="padding: 10px 12px 12px 12px;">
-                                <div class="cardText" style="font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #fff;">
-                                    ${it.Name}
-                                </div>
-                                <div class="cardText" style="font-size: 12px; color: rgba(255,255,255,0.55); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px;">
-                                    ${parentName ? `${parentName} · ` : ''}${timeAgo}
+                    <div class="pp-recent-card" data-id="${it.Id}" onclick="window.location.hash='#/details?id=${it.Id}'">
+                        <div class="pp-recent-thumb">
+                            ${imgUrl ? `<div class="pp-recent-img" style="background-image: url('${imgUrl}');"></div>` : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#4b5563;"><span class="material-icons" style="font-size:42px;">movie</span></div>`}
+                            ${statusBadge}
+                            <div class="pp-recent-playbtn" onclick="event.stopPropagation(); window.location.hash='#/details?id=${it.Id}';">
+                                <div class="pp-recent-playicon">
+                                    <span class="material-icons" style="font-size:26px; margin-left:2px;">play_arrow</span>
                                 </div>
                             </div>
+                            ${progressPercent > 0 && progressPercent < 92 ? `
+                                <div class="pp-recent-progbar">
+                                    <div class="pp-recent-progfill" style="width: ${progressPercent}%;"></div>
+                                </div>
+                            ` : ""}
+                        </div>
+                        <div class="pp-recent-info">
+                            <div class="pp-recent-title" title="${mainTitle}">${mainTitle}</div>
+                            <div class="pp-recent-subtitle" title="${subTitle}">${subTitle}</div>
                         </div>
                     </div>
                 `;
             });
 
+            let sectionEl = existingSection;
+            if (!sectionEl) {
+                sectionEl = document.createElement("div");
+                sectionEl.id = "customRecentWatchedSection";
+                sectionEl.className = "verticalSection customRecentSection";
+            }
+
             sectionEl.innerHTML = `
-                <div style="display: flex; align-items: baseline; justify-content: space-between; padding: 0 1.5em; margin-bottom: 0.6em;">
-                    <h2 class="sectionTitle sectionTitle-cards" style="margin: 0; font-size: 1.45em; font-weight: 600; color: #fff;">
-                        最近观看
-                    </h2>
-                    <span style="font-size: 12px; color: rgba(255,255,255,0.45);">播放历史与断点续播</span>
+                <div style="display: flex; align-items: baseline; justify-content: space-between; padding: 0 1.5em; margin-bottom: 0.65em;">
+                    <div style="display: flex; align-items: baseline; gap: 8px;">
+                        <h2 class="sectionTitle sectionTitle-cards" style="margin: 0; font-size: 1.45em; font-weight: 600; color: #fff; letter-spacing: 0.3px;">
+                            最近观看
+                        </h2>
+                        <span style="font-size: 12px; color: #9ca3af;">播放历史与进度</span>
+                    </div>
+                    <span style="font-size: 12px; color: #6b7280; font-variant-numeric: tabular-nums;">${items.length} 个项目</span>
                 </div>
-                <div style="display: flex; overflow-x: auto; padding: 0.4em 1.5em; scrollbar-width: thin; -webkit-overflow-scrolling: touch;">
+                <div style="display: flex; overflow-x: auto; padding: 0.5em 1.5em 1em 1.5em; scrollbar-width: thin; -webkit-overflow-scrolling: touch;">
                     ${cardsHtml}
                 </div>
             `;
 
-            if (myMediaSection && myMediaSection.nextSibling) {
-                homeContainer.insertBefore(sectionEl, myMediaSection.nextSibling);
-            } else {
-                homeContainer.appendChild(sectionEl);
+            if (!existingSection) {
+                const myMediaSection = homeContainer.querySelector(".section0") || homeContainer.firstElementChild;
+                if (myMediaSection && myMediaSection.nextSibling) {
+                    homeContainer.insertBefore(sectionEl, myMediaSection.nextSibling);
+                } else {
+                    homeContainer.appendChild(sectionEl);
+                }
             }
 
         } catch (e) {
-            console.error('Error in recent watched script:', e);
+            console.error("[Recent-Watched] Error rendering section:", e);
         } finally {
-            isUpdating = false;
+            isRecentUpdating = false;
         }
     }
 
-    const observer = new MutationObserver(() => {
+    const recentObserver = new MutationObserver(() => {
         checkRecentSection();
     });
+    recentObserver.observe(document.body, { childList: true, subtree: true });
 
-    observer.observe(document.body, { childList: true, subtree: true });
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', checkRecentSection);
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => checkRecentSection(true));
     } else {
-        setTimeout(checkRecentSection, 400);
+        setTimeout(() => checkRecentSection(true), 300);
     }
-    window.addEventListener('hashchange', () => {
-        setTimeout(checkRecentSection, 300);
+
+    window.addEventListener("hashchange", () => {
+        setTimeout(() => checkRecentSection(true), 250);
+    });
+
+    window.addEventListener("focus", () => {
+        checkRecentSection(true);
     });
 
 })();

@@ -1,7 +1,86 @@
-// Jellyfin Custom Recent Watched (最近观看) Feature
+// Jellyfin Custom Enhancement:
+// 1. PotPlayer-Style Aggressive Full-Episode Buffering Engine (7200s, 2GB Buffer)
+// 2. Persistent "最近观看" (Recently Watched) Section with Playback Progress & History
+
 (function() {
     'use strict';
 
+    // =========================================================================
+    // 1. PotPlayer-Style Aggressive Buffering Engine
+    // =========================================================================
+    function applyHlsBufferConfig(HlsClass) {
+        if (!HlsClass) return;
+        if (HlsClass.DefaultConfig) {
+            HlsClass.DefaultConfig.maxBufferLength = 7200; // 2 hours buffer ahead
+            HlsClass.DefaultConfig.maxMaxBufferLength = 14400; // 4 hours
+            HlsClass.DefaultConfig.maxBufferSize = 2 * 1024 * 1024 * 1024; // 2GB buffer in RAM
+            HlsClass.DefaultConfig.backBufferLength = 1800; // 30 minutes back buffer
+            HlsClass.DefaultConfig.maxBufferHole = 0.5;
+            HlsClass.DefaultConfig.lowLatencyMode = false;
+        }
+    }
+
+    function wrapHlsConstructor(OriginalHls) {
+        if (!OriginalHls || OriginalHls.__potplayerWrapped) return OriginalHls;
+        function EnhancedHls(userConfig) {
+            userConfig = userConfig || {};
+            userConfig.maxBufferLength = 7200;
+            userConfig.maxMaxBufferLength = 14400;
+            userConfig.maxBufferSize = 2 * 1024 * 1024 * 1024;
+            userConfig.backBufferLength = 1800;
+            userConfig.maxBufferHole = 0.5;
+            userConfig.lowLatencyMode = false;
+            userConfig.manifestLoadingTimeOut = 30000;
+            console.log('[PotPlayer-Buffer] Instantiating Hls with continuous full episode buffer (7200s, 2GB)');
+            return new OriginalHls(userConfig);
+        }
+        EnhancedHls.prototype = OriginalHls.prototype;
+        Object.assign(EnhancedHls, OriginalHls);
+        EnhancedHls.DefaultConfig = OriginalHls.DefaultConfig;
+        applyHlsBufferConfig(EnhancedHls);
+        EnhancedHls.__potplayerWrapped = true;
+        return EnhancedHls;
+    }
+
+    let _hls = window.Hls ? wrapHlsConstructor(window.Hls) : null;
+    try {
+        Object.defineProperty(window, 'Hls', {
+            get() { return _hls; },
+            set(val) {
+                _hls = wrapHlsConstructor(val);
+                console.log('[PotPlayer-Buffer] window.Hls hooked successfully.');
+            },
+            configurable: true
+        });
+    } catch (e) {
+        if (window.Hls) {
+            window.Hls = wrapHlsConstructor(window.Hls);
+        }
+    }
+
+    // Direct Play Video Pre-buffering
+    document.addEventListener('play', (e) => {
+        if (e.target && e.target.tagName === 'VIDEO') {
+            const video = e.target;
+            video.preload = 'auto';
+            console.log('[PotPlayer-Buffer] Video element detected. Set preload=auto for full pre-buffering.');
+
+            // Monitor buffer progress
+            video.addEventListener('progress', () => {
+                if (video.buffered && video.buffered.length > 0 && video.duration) {
+                    const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+                    const percent = Math.min(100, Math.round((bufferedEnd / video.duration) * 100));
+                    const bufferedMins = (bufferedEnd / 60).toFixed(1);
+                    const totalMins = (video.duration / 60).toFixed(1);
+                    console.debug(`[PotPlayer-Buffer] 缓冲进度: ${percent}% (${bufferedMins} / ${totalMins} 分钟)`);
+                }
+            });
+        }
+    }, true);
+
+    // =========================================================================
+    // 2. Persistent "最近观看" (Recently Watched) Home Section
+    // =========================================================================
     function formatTimeAgo(isoString) {
         if (!isoString) return '';
         try {

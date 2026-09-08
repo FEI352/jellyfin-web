@@ -43,7 +43,31 @@ function getItemsToResumeFn(
         };
 
         return queryClient
-            .fetchQuery(getResumeItemsQuery(api, options));
+            .fetchQuery(getResumeItemsQuery(api, options))
+            .then(async (res: any) => {
+                if (res?.Items && res.Items.length > 0) {
+                    return res;
+                }
+                if (mediaType === 'Video') {
+                    try {
+                        const played = await apiClient.getItems(apiClient.getCurrentUserId(), {
+                            SortBy: 'DatePlayed',
+                            SortOrder: 'Descending',
+                            Recursive: true,
+                            IncludeItemTypes: 'Movie,Episode,Video',
+                            Limit: limit,
+                            fields: 'ParentId,SeriesName,PrimaryImageAspectRatio'
+                        });
+                        return {
+                            Items: (played?.Items || []).filter((it: any) => it.UserData && it.UserData.LastPlayedDate),
+                            TotalRecordCount: played?.TotalRecordCount || 0
+                        };
+                    } catch (err) {
+                        console.error('Error fetching recently played items fallback:', err);
+                    }
+                }
+                return res;
+            });
     };
 }
 

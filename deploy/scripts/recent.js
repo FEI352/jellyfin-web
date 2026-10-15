@@ -67,17 +67,30 @@
 
     if (window.fetch) {
         const origFetch = window.fetch;
-        window.fetch = function(input, init) {
-            if (!forceDirectPlayNative && init && typeof init.body === 'string' && init.body.includes('DirectPlayProfiles')) {
-                try {
-                    const parsed = JSON.parse(init.body);
-                    if (parsed.DeviceProfile && Array.isArray(parsed.DeviceProfile.DirectPlayProfiles)) {
-                        parsed.DeviceProfile.DirectPlayProfiles = parsed.DeviceProfile.DirectPlayProfiles.filter(p => p.Type !== 'Video');
-                        init.body = JSON.stringify(parsed);
-                        console.log('[PotPlayer-Buffer] Filtered fetch DirectPlayProfiles -> HLS DirectStream active');
+        window.fetch = async function(input, init) {
+            try {
+                if (!forceDirectPlayNative) {
+                    if (init && typeof init.body === 'string' && init.body.includes('DirectPlayProfiles')) {
+                        const parsed = JSON.parse(init.body);
+                        if (parsed.DeviceProfile && Array.isArray(parsed.DeviceProfile.DirectPlayProfiles)) {
+                            parsed.DeviceProfile.DirectPlayProfiles = parsed.DeviceProfile.DirectPlayProfiles.filter(p => p.Type !== 'Video');
+                            init.body = JSON.stringify(parsed);
+                            console.log('[PotPlayer-Buffer] Filtered fetch init.body DirectPlayProfiles -> HLS DirectStream active');
+                        }
+                    } else if (input instanceof Request && input.method === 'POST') {
+                        const cloned = input.clone();
+                        const text = await cloned.text();
+                        if (text && text.includes('DirectPlayProfiles')) {
+                            const parsed = JSON.parse(text);
+                            if (parsed.DeviceProfile && Array.isArray(parsed.DeviceProfile.DirectPlayProfiles)) {
+                                parsed.DeviceProfile.DirectPlayProfiles = parsed.DeviceProfile.DirectPlayProfiles.filter(p => p.Type !== 'Video');
+                                const newReq = new Request(input, { body: JSON.stringify(parsed) });
+                                return origFetch.call(this, newReq);
+                            }
+                        }
                     }
-                } catch (e) {}
-            }
+                }
+            } catch (e) {}
             return origFetch.apply(this, arguments);
         };
     }
@@ -117,7 +130,7 @@
                 }
 
                 // Hook fragment progress & load events for realtime speed monitoring
-                if (HlsClass.Events) {
+                if (typeof this.on === 'function' && HlsClass.Events) {
                     if (HlsClass.Events.FRAG_LOAD_PROGRESS) {
                         this.on(HlsClass.Events.FRAG_LOAD_PROGRESS, (event, data) => {
                             const now = Date.now();
@@ -203,9 +216,15 @@
     // CRITICAL: Ensure pre-buffering KEEPS RUNNING even when the user PAUSES the video!
     document.addEventListener('pause', (e) => {
         if (e.target && e.target.tagName === 'VIDEO') {
+            const video = e.target;
             console.log('[PotPlayer-Buffer] Video paused. Forcing continuous background pre-buffering...');
             if (activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
-                activeHlsInstance.startLoad();
+                let currentEnd = 0;
+                for (let i = 0; i < video.buffered.length; i++) {
+                    const end = video.buffered.end(i);
+                    if (end > currentEnd) currentEnd = end;
+                }
+                activeHlsInstance.startLoad(currentEnd > 0 ? currentEnd : -1);
             }
         }
     }, true);
@@ -243,12 +262,93 @@
                 lastProgressTime = now;
             }
 
-            // If paused and Hls is available, make sure startLoad stays active
-            if (video.paused && activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
-                activeHlsInstance.startLoad();
+            // Continuous buffer driver: ensure Hls keeps loading forward
+            if (activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
+                const dur = video.duration || 0;
+                if (dur > 0 && currentEnd < dur - 2) {
+                    activeHlsInstance.startLoad(currentEnd > 0 ? currentEnd : -1);
+                }
+            }
+
+            // DirectPlay MP4 Range prefetcher: keep fetching ahead into CacheStorage
+            if (!activeHlsInstance && video.currentSrc && video.duration > 0) {
+                prefetchDirectPlayRange(video, currentEnd);
             }
         }
     }, true);
+
+    let isPrefetching = false;
+    let prefetchedFrontierSec = 0;
+    let lastKnownVideoSrc = '';
+    async function prefetchDirectPlayRange(video, currentEndSec) {
+        if (isPrefetching) return;
+        const dur = video.duration || 0;
+        if (dur <= 0) return;
+
+        const src = video.currentSrc;
+        if (!src || src.includes('.m3u8')) return;
+
+        if (src !== lastKnownVideoSrc) {
+            lastKnownVideoSrc = src;
+            prefetchedFrontierSec = currentEndSec;
+        } else {
+            prefetchedFrontierSec = Math.max(prefetchedFrontierSec, currentEndSec);
+        }
+
+        if (prefetchedFrontierSec >= dur - 2) return;
+
+        isPrefetching = true;
+        try {
+            const estBitrate = effectiveBitrateBps || (4 * 1024 * 1024);
+            const startSec = prefetchedFrontierSec;
+            const endSec = Math.min(dur, startSec + 120); // fetch next 120s chunk
+            const startByte = Math.floor(startSec * (estBitrate / 8));
+            const endByte = Math.floor(endSec * (estBitrate / 8));
+
+            const t0 = performance.now();
+            const resp = await fetch(src, {
+                headers: {
+                    'Range': `bytes=${startByte}-${endByte}`
+                }
+            });
+            if (resp.ok || resp.status === 206) {
+                const buf = await resp.arrayBuffer();
+                const elapsedSec = (performance.now() - t0) / 1000;
+                if (buf && buf.byteLength > 0) {
+                    if (elapsedSec > 0.05) {
+                        instantSpeedBps = buf.byteLength / elapsedSec;
+                        lastChunkDownloadedTime = Date.now();
+                    }
+                    prefetchedFrontierSec = endSec;
+                }
+            }
+        } catch (e) {
+        } finally {
+            setTimeout(() => { isPrefetching = false; }, 200);
+        }
+    }
+
+    // Active heartbeat pump: runs every 800ms whether playing or paused!
+    setInterval(() => {
+        const video = document.querySelector('video');
+        if (!video || !video.duration || isNaN(video.duration)) return;
+        const dur = video.duration;
+
+        let currentEnd = prefetchedFrontierSec;
+        for (let i = 0; i < video.buffered.length; i++) {
+            const end = video.buffered.end(i);
+            if (end > currentEnd) currentEnd = end;
+        }
+
+        if (currentEnd < dur - 2) {
+            if (activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
+                activeHlsInstance.startLoad(currentEnd > 0 ? currentEnd : -1);
+            }
+            if (!activeHlsInstance && video.currentSrc) {
+                prefetchDirectPlayRange(video, currentEnd);
+            }
+        }
+    }, 800);
 
     // =========================================================================
     // 2. Minimalist English HUD Control Bar (PotPlayer Style)
@@ -266,10 +366,11 @@
         .potplayer-hud {
             display: inline-flex !important;
             align-items: center !important;
-            gap: 4px !important;
+            gap: 6px !important;
             margin-right: auto !important;
+            margin-left: 12px !important;
             user-select: none !important;
-            z-index: 100 !important;
+            z-index: 1000 !important;
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
         }
 
@@ -501,23 +602,42 @@
 
         if (action === 'direct') {
             forceDirectPlayNative = false;
-            if (pm && pm.setMaxStreamingBitrate && player) {
-                pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 0 }, player);
-            } else {
-                const sBtn = document.querySelector('.btnVideoOsdSettings');
-                if (sBtn) sBtn.click();
+            // Clear transcode restriction and trigger direct play
+            if (pm && player) {
+                if (typeof pm.setMaxStreamingBitrate === 'function') {
+                    pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 140000000 }, player);
+                }
+                if (typeof pm.changeQuality === 'function') {
+                    pm.changeQuality(140000000, player);
+                }
+            }
+            // Trigger playback settings re-selection or prompt
+            const sBtn = document.querySelector('.btnVideoOsdSettings');
+            if (sBtn) {
+                sBtn.click();
+                setTimeout(() => {
+                    const qualityItems = Array.from(document.querySelectorAll('.actionSheetMenuItemTitle'));
+                    const directItem = qualityItems.find(t => t.textContent.includes('直接') || t.textContent.includes('Direct') || t.textContent.includes('1080p - 原始') || t.textContent.includes('Auto'));
+                    if (directItem) directItem.closest('.actionSheetMenuItem')?.click();
+                    else {
+                        const backBtn = document.querySelector('.actionSheetCloseBtn, .actionSheetBackBtn');
+                        if (backBtn) backBtn.click();
+                    }
+                }, 100);
             }
         } else if (action === 'native-mp4') {
             forceDirectPlayNative = true;
-            if (pm && pm.setMaxStreamingBitrate && player) {
-                pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 0 }, player);
+            if (pm && player && typeof pm.setMaxStreamingBitrate === 'function') {
+                pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 140000000 }, player);
             }
         } else if (action === 'transcode-1080p') {
-            if (pm && pm.setMaxStreamingBitrate && player) {
+            forceDirectPlayNative = false;
+            if (pm && player && typeof pm.setMaxStreamingBitrate === 'function') {
                 pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 10000000 }, player);
             }
         } else if (action === 'transcode-720p') {
-            if (pm && pm.setMaxStreamingBitrate && player) {
+            forceDirectPlayNative = false;
+            if (pm && player && typeof pm.setMaxStreamingBitrate === 'function') {
                 pm.setMaxStreamingBitrate({ enableAutomaticBitrateDetection: false, maxBitrate: 4000000 }, player);
             }
         } else if (action === 'stats') {
@@ -603,17 +723,15 @@
 
     // Main HUD update loop
     function updateHud() {
-        const osdControls = document.querySelector('.videoOsdBottom-maincontrols .buttons');
-        if (!osdControls) {
+        const timeText = document.querySelector('.osdTimeText') || document.querySelector('.videoOsdBottom-timeText');
+        if (!timeText) {
             closeMenu();
             return;
         }
 
         let hud = document.getElementById('potplayerHud');
-        if (!hud) {
-            const timeText = osdControls.querySelector('.osdTimeText');
-            if (!timeText) return;
-
+        if (!hud || !timeText.parentElement.contains(hud)) {
+            if (hud) hud.remove();
             hud = document.createElement('div');
             hud.id = 'potplayerHud';
             hud.className = 'potplayer-hud';
@@ -680,12 +798,27 @@
                 }
             }
 
-            bufferPercent = Math.min(100, Math.round((totalEnd / video.duration) * 100));
+            const effectiveEnd = Math.max(totalEnd, prefetchedFrontierSec);
+            bufferPercent = Math.min(100, Math.round((effectiveEnd / video.duration) * 100));
             isBufferFull = bufferPercent >= 99;
 
-            // Keep loading active when paused
-            if (video.paused && activeHlsInstance && typeof activeHlsInstance.startLoad === 'function') {
-                activeHlsInstance.startLoad();
+            // Update progress bar visuals to reflect prefetched frontier
+            const sliderBg = document.querySelector('.mdl-slider__background-lower, .sliderBubbleBackground, .itemProgressBarForeground');
+            if (sliderBg && video.duration > 0) {
+                const pct = Math.min(100, Math.round((effectiveEnd / video.duration) * 100));
+                sliderBg.style.width = pct + '%';
+            }
+
+            // Continuous buffer driver: ensure HLS keeps loading ahead smoothly until full episode is buffered
+            if (activeHlsInstance) {
+                if (!isBufferFull) {
+                    if (typeof activeHlsInstance.startLoad === 'function') {
+                        activeHlsInstance.startLoad(totalEnd > 0 ? totalEnd : -1);
+                    }
+                }
+            } else if (video && video.currentSrc) {
+                // DirectPlay active buffer pumping:
+                prefetchDirectPlayRange(video, totalEnd);
             }
         }
 
@@ -760,8 +893,32 @@
             display: none !important;
         }
 
+        /* Reset native section styles to ensure proper flow */
+        .section0,
+        .verticalSection.section0 {
+            display: block !important;
+            position: relative !important;
+            width: 100% !important;
+            clear: both !important;
+            margin-bottom: 24px !important;
+            min-height: auto !important;
+        }
+
+        /* Ensure .section0's inner card slider clears height properly */
+        .section0 .itemsContainer,
+        .section0 .emby-scrollbars {
+            position: relative !important;
+            display: flex !important;
+            clear: both !important;
+        }
+
         .customRecentSection {
-            margin: 1.2em 0 1.6em 0 !important;
+            margin: 24px 0 16px 0 !important;
+            clear: both !important;
+            position: relative !important;
+            z-index: 2 !important;
+            display: block !important;
+            width: 100% !important;
             animation: ppRecentFadeIn 0.25s ease-out;
         }
 
@@ -912,6 +1069,85 @@
             align-items: center;
             gap: 4px;
         }
+
+        .pp-recent-head-title {
+            color: #fff;
+        }
+        .pp-recent-head-desc {
+            color: #9ca3af;
+        }
+        .pp-recent-head-count {
+            color: #6b7280;
+        }
+
+        /* Light theme overrides for custom recent section */
+        .pp-recent-header.pp-head-light .pp-recent-head-title,
+        html[data-theme="light"] .pp-recent-head-title,
+        html.theme-light .pp-recent-head-title,
+        .theme-light .pp-recent-head-title,
+        body.theme-light .pp-recent-head-title {
+            color: #111827 !important;
+        }
+        .pp-recent-header.pp-head-light .pp-recent-head-desc,
+        html[data-theme="light"] .pp-recent-head-desc,
+        html.theme-light .pp-recent-head-desc,
+        .theme-light .pp-recent-head-desc,
+        body.theme-light .pp-recent-head-desc {
+            color: #4b5563 !important;
+        }
+        .pp-recent-header.pp-head-light .pp-recent-head-count,
+        html[data-theme="light"] .pp-recent-head-count,
+        html.theme-light .pp-recent-head-count,
+        .theme-light .pp-recent-head-count,
+        body.theme-light .pp-recent-head-count {
+            color: #6b7280 !important;
+        }
+
+        .pp-recent-card.pp-card-light,
+        html[data-theme="light"] .pp-recent-card,
+        html.theme-light .pp-recent-card,
+        .theme-light .pp-recent-card,
+        body.theme-light .pp-recent-card {
+            background: #ffffff !important;
+            border: 1px solid rgba(0, 0, 0, 0.08) !important;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+        }
+        .pp-recent-card.pp-card-light:hover,
+        html[data-theme="light"] .pp-recent-card:hover,
+        html.theme-light .pp-recent-card:hover,
+        .theme-light .pp-recent-card:hover,
+        body.theme-light .pp-recent-card:hover {
+            border-color: rgba(245, 158, 11, 0.6) !important;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12), 0 0 10px rgba(245, 158, 11, 0.25) !important;
+        }
+        .pp-recent-card.pp-card-light .pp-recent-thumb,
+        html[data-theme="light"] .pp-recent-thumb,
+        html.theme-light .pp-recent-thumb,
+        .theme-light .pp-recent-thumb,
+        body.theme-light .pp-recent-thumb {
+            background: #f3f4f6 !important;
+        }
+        .pp-recent-card.pp-card-light .pp-recent-title,
+        html[data-theme="light"] .pp-recent-title,
+        html.theme-light .pp-recent-title,
+        .theme-light .pp-recent-title,
+        body.theme-light .pp-recent-title {
+            color: #111827 !important;
+        }
+        .pp-recent-card.pp-card-light .pp-recent-subtitle,
+        html[data-theme="light"] .pp-recent-subtitle,
+        html.theme-light .pp-recent-subtitle,
+        .theme-light .pp-recent-subtitle,
+        body.theme-light .pp-recent-subtitle {
+            color: #4b5563 !important;
+        }
+        .pp-recent-card.pp-card-light .pp-recent-progtrack,
+        html[data-theme="light"] .pp-recent-progtrack,
+        html.theme-light .pp-recent-progtrack,
+        .theme-light .pp-recent-progtrack,
+        body.theme-light .pp-recent-progtrack {
+            background: rgba(0, 0, 0, 0.08) !important;
+        }
     `;
     if (!document.getElementById("potplayer-recent-watched-style")) {
         document.head.appendChild(recentGlobalStyle);
@@ -961,22 +1197,49 @@
     let isRecentUpdating = false;
     let cachedParentMap = {};
 
-    async function checkRecentSection(forceRefresh) {
-        if (isRecentUpdating) return;
+    async function checkRecentSection(forceRefresh = false) {
+        if (isRecentUpdating) { console.log("[RW-DBG] skip: isRecentUpdating"); return; }
         const hash = window.location.hash || "";
-        if (hash && !hash.startsWith("#/home") && hash !== "#/" && hash !== "") {
+        if (hash.includes("login") || hash.includes("selectserver")) {
+            console.log("[RW-DBG] skip: on login/selectserver page");
             return;
         }
 
-        if (!window.ApiClient || !window.ApiClient.getCurrentUserId) {
-            return;
+        const hasApiClient = !!(window.ApiClient);
+        const hasGetCurrentUserId = !!(window.ApiClient && window.ApiClient.getCurrentUserId);
+        let userId = hasGetCurrentUserId ? window.ApiClient.getCurrentUserId() : null;
+        console.log("[RW-DBG] userId from ApiClient:", userId, "hasApiClient:", hasApiClient, "hash:", hash);
+        if (!userId) {
+            try {
+                const credsStr = localStorage.getItem("jellyfin_credentials");
+                if (credsStr) {
+                    const creds = JSON.parse(credsStr);
+                    if (creds && creds.Servers && creds.Servers[0]) {
+                        userId = creds.Servers[0].UserId;
+                        console.log("[RW-DBG] userId from localStorage:", userId);
+                    }
+                }
+            } catch (e) {}
         }
 
-        const userId = window.ApiClient.getCurrentUserId();
-        if (!userId) return;
-
-        const homeContainer = document.querySelector(".homeSectionsContainer") || document.querySelector(".sections");
-        if (!homeContainer) return;
+        // CRITICAL: homeContainer MUST be the sections container, not a child or custom section itself!
+        let homeContainer = document.querySelector(".homeSectionsContainer") || document.querySelector(".sections:not(.customRecentSection)") || document.querySelector(".page:not(.hide) .contentScrollSlider") || document.querySelector(".view:not(.hide) .contentScrollSlider");
+        if (!homeContainer || homeContainer.id === "customRecentWatchedSection" || homeContainer.classList.contains("customRecentSection")) {
+            // Fallback to active view/page
+            homeContainer = document.querySelector(".page:not(.hide)") || document.querySelector(".view:not(.hide)") || document.querySelector(".mainAnimatedPages > div:not(.hide)") || document.querySelector(".mainAnimatedPages");
+        }
+        console.log("[RW-DBG] homeContainer:", homeContainer ? homeContainer.tagName + '.' + homeContainer.className.substring(0, 40) : 'NULL');
+        if (!homeContainer || homeContainer.id === "customRecentWatchedSection") {
+            // Last resort: find parent of .section0
+            const sec0 = document.querySelector(".section0") || document.querySelector(".verticalSection");
+            if (sec0 && sec0.parentElement) {
+                homeContainer = sec0.parentElement;
+                console.log("[RW-DBG] recovered homeContainer from sec0 parent:", homeContainer.tagName + '.' + homeContainer.className.substring(0, 40));
+            } else {
+                console.log("[RW-DBG] skip: valid homeContainer not found, will retry on next 1.5s tick");
+                return;
+            }
+        }
 
         const existingSection = document.getElementById("customRecentWatchedSection");
         if (existingSection && !forceRefresh) {
@@ -991,7 +1254,9 @@
                 localProgress = JSON.parse(localStorage.getItem("jf_recent_progress") || "{}");
             } catch (e) {}
 
-            // Fetch server DatePlayed items (chronological order of every episode/movie ever opened)
+            // Fetch server DatePlayed items
+        let items = [];
+        try {
             const queryParams = {
                 SortBy: "DatePlayed",
                 SortOrder: "Descending",
@@ -1001,13 +1266,38 @@
                 fields: "ParentId,SeriesName,PrimaryImageAspectRatio,UserData,RunTimeTicks"
             };
 
+            console.log("[RW-DBG] calling getItems with userId:", userId);
             const result = await window.ApiClient.getItems(userId, queryParams);
-            const items = (result && result.Items) ? result.Items.filter(it => it.UserData && it.UserData.LastPlayedDate) : [];
-
-            if (!items.length) {
-                if (existingSection) existingSection.remove();
-                return;
+            console.log("[RW-DBG] getItems result:", result ? result.Items?.length + " items" : "null");
+            if (result && result.Items && result.Items.length) {
+                items = result.Items.filter(it => it.UserData && (it.UserData.LastPlayedDate || it.UserData.PlaybackPositionTicks > 0));
+                console.log("[RW-DBG] after filter:", items.length, "items");
+                if (!items.length) {
+                    items = result.Items;
+                    console.log("[RW-DBG] filter empty, using all:", items.length);
+                }
             }
+            if (!items.length) {
+                console.log("[RW-DBG] trying getResumeItems...");
+                const res = await window.ApiClient.getResumeItems(userId, { Limit: 16 });
+                console.log("[RW-DBG] getResumeItems result:", res ? res.Items?.length + " items" : "null");
+                if (res && res.Items && res.Items.length) {
+                    items = res.Items;
+                }
+            }
+        } catch (e) {
+            console.warn("[RW-DBG] getItems FAILED:", e.message || e);
+            try {
+                const res = await window.ApiClient.getResumeItems(userId, { Limit: 16 });
+                items = (res && res.Items) ? res.Items : [];
+            } catch (e2) {}
+        }
+
+        if (!items || !items.length) {
+            console.log("[RW-DBG] NO ITEMS - returning. userId was:", userId);
+            return;
+        }
+        console.log("[RW-DBG] RENDERING", items.length, "items into DOM");
 
             // Batch resolve parent names (e.g. series or folder titles)
             const parentIds = [...new Set(items.map(it => it.ParentId).filter(Boolean))];
@@ -1021,20 +1311,31 @@
                 }));
             }
 
+            // Determine light/dark mode once (before forEach, so it's accessible in section header)
+            let isLight = false;
+            try {
+                const themeLink = document.querySelector('link[href*="theme.css"]');
+                if (themeLink && themeLink.getAttribute('href') && themeLink.getAttribute('href').includes('light')) isLight = true;
+                if (document.documentElement.getAttribute('data-theme') === 'light' || document.body.classList.contains('theme-light')) isLight = true;
+                if (localStorage.getItem('jf_custom_theme') === 'light') isLight = true;
+            } catch (e) {}
+
             let cardsHtml = "";
             items.forEach(it => {
+                if (!it) return;
                 const parentName = cachedParentMap[it.ParentId] || it.SeriesName || "";
                 const local = localProgress[it.Id];
 
                 // Determine effective playback progress
                 let progressPercent = 0;
                 let statusBadge = "";
+                const uData = it.UserData || {};
 
-                if (it.UserData.Played) {
+                if (uData.Played) {
                     statusBadge = '<span class="pp-recent-badge pp-badge-played">已看完</span>';
                 } else {
-                    if (it.UserData.PlaybackPositionTicks && it.RunTimeTicks) {
-                        progressPercent = Math.min(100, Math.round((it.UserData.PlaybackPositionTicks / it.RunTimeTicks) * 100));
+                    if (uData.PlaybackPositionTicks && it.RunTimeTicks) {
+                        progressPercent = Math.min(100, Math.round((uData.PlaybackPositionTicks / it.RunTimeTicks) * 100));
                     }
                     if (local && local.percent > progressPercent) {
                         progressPercent = local.percent;
@@ -1050,7 +1351,7 @@
                 }
 
                 // Time ago
-                const timeAgo = formatTimeAgo(it.UserData.LastPlayedDate, local?.time);
+                const timeAgo = formatTimeAgo(uData.LastPlayedDate, local?.time);
 
                 // Image resolution hierarchy: Primary -> Thumb -> Backdrop -> Parent Primary
                 let imgUrl = "";
@@ -1069,7 +1370,7 @@
                 const subTitle = parentName ? `${it.Name} · ${timeAgo}` : timeAgo;
 
                 cardsHtml += `
-                    <div class="pp-recent-card" data-id="${it.Id}" onclick="window.location.hash='#/details?id=${it.Id}'">
+                    <div class="pp-recent-card ${isLight ? 'pp-card-light' : ''}" data-id="${it.Id}" onclick="window.location.hash='#/details?id=${it.Id}'">
                         <div class="pp-recent-thumb">
                             ${imgUrl ? `<div class="pp-recent-img" style="background-image: url('${imgUrl}');"></div>` : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#4b5563;"><span class="material-icons" style="font-size:42px;">movie</span></div>`}
                             ${statusBadge}
@@ -1084,9 +1385,9 @@
                                 </div>
                             ` : ""}
                         </div>
-                        <div class="pp-recent-info">
-                            <div class="pp-recent-title" title="${mainTitle}">${mainTitle}</div>
-                            <div class="pp-recent-subtitle" title="${subTitle}">${subTitle}</div>
+                        <div class="pp-recent-info" style="${isLight ? 'background:#ffffff !important;' : ''}">
+                            <div class="pp-recent-title" title="${mainTitle}" style="${isLight ? 'color:#111827 !important;' : ''}">${mainTitle}</div>
+                            <div class="pp-recent-subtitle" title="${subTitle}" style="${isLight ? 'color:#4b5563 !important;' : ''}">${subTitle}</div>
                         </div>
                     </div>
                 `;
@@ -1100,14 +1401,14 @@
             }
 
             sectionEl.innerHTML = `
-                <div style="display: flex; align-items: baseline; justify-content: space-between; padding: 0 1.5em; margin-bottom: 0.65em;">
+                <div class="pp-recent-header ${isLight ? 'pp-head-light' : ''}" style="display: flex; align-items: baseline; justify-content: space-between; padding: 0 1.5em; margin-bottom: 0.65em;">
                     <div style="display: flex; align-items: baseline; gap: 8px;">
-                        <h2 class="sectionTitle sectionTitle-cards" style="margin: 0; font-size: 1.45em; font-weight: 600; color: #fff; letter-spacing: 0.3px;">
+                        <h2 class="sectionTitle sectionTitle-cards pp-recent-head-title" style="margin: 0; font-size: 1.45em; font-weight: 600; letter-spacing: 0.3px; ${isLight ? 'color: #111827 !important;' : ''}">
                             最近观看
                         </h2>
-                        <span style="font-size: 12px; color: #9ca3af;">播放历史与进度</span>
+                        <span class="pp-recent-head-desc" style="font-size: 12px; ${isLight ? 'color: #4b5563 !important;' : ''}">播放历史与进度</span>
                     </div>
-                    <span style="font-size: 12px; color: #6b7280; font-variant-numeric: tabular-nums;">${items.length} 个项目</span>
+                    <span class="pp-recent-head-count" style="font-size: 12px; font-variant-numeric: tabular-nums; ${isLight ? 'color: #6b7280 !important;' : ''}">${items.length} 个项目</span>
                 </div>
                 <div style="display: flex; overflow-x: auto; padding: 0.5em 1.5em 1em 1.5em; scrollbar-width: thin; -webkit-overflow-scrolling: touch;">
                     ${cardsHtml}
@@ -1115,12 +1416,36 @@
             `;
 
             if (!existingSection) {
-                const myMediaSection = homeContainer.querySelector(".section0") || homeContainer.firstElementChild;
-                if (myMediaSection && myMediaSection.nextSibling) {
-                    homeContainer.insertBefore(sectionEl, myMediaSection.nextSibling);
-                } else {
-                    homeContainer.appendChild(sectionEl);
+                // Find anchor: .section0 or first .verticalSection that is NOT our custom section
+                let myMediaSection = document.querySelector(".section0");
+                if (!myMediaSection) {
+                    const allSecs = document.querySelectorAll(".verticalSection");
+                    for (let s of allSecs) {
+                        if (s.id !== "customRecentWatchedSection") {
+                            myMediaSection = s;
+                            break;
+                        }
+                    }
                 }
+                if (myMediaSection && myMediaSection.parentNode) {
+                    // Check if myMediaSection is currently in a flex/grid layout
+                    myMediaSection.parentNode.insertBefore(sectionEl, myMediaSection.nextSibling);
+                    console.log("[RW-DBG] inserted after myMediaSection into its parent:", myMediaSection.parentNode.tagName + '.' + myMediaSection.parentNode.className);
+                } else {
+                    const targetContainer = document.querySelector(".homeSectionsContainer") || document.querySelector(".sections") || homeContainer;
+                    if (targetContainer) {
+                        targetContainer.appendChild(sectionEl);
+                        console.log("[RW-DBG] appended to targetContainer:", targetContainer.className);
+                    }
+                }
+            } else if (!document.getElementById("customRecentWatchedSection")) {
+                if (homeContainer) homeContainer.appendChild(sectionEl);
+                console.log("[RW-DBG] appended (existingSection was stale)");
+            }
+            const inDOM = document.getElementById("customRecentWatchedSection");
+            console.log("[RW-DBG] section in DOM check:", !!inDOM, inDOM ? inDOM.offsetHeight : 'null');
+            if (inDOM) {
+                console.log("[RW-DBG] section style display:", window.getComputedStyle(inDOM).display, "visibility:", window.getComputedStyle(inDOM).visibility, "parent:", inDOM.parentElement?.tagName + '.' + inDOM.parentElement?.className);
             }
 
         } catch (e) {
@@ -1130,10 +1455,16 @@
         }
     }
 
-    const recentObserver = new MutationObserver(() => {
-        checkRecentSection();
-    });
-    recentObserver.observe(document.body, { childList: true, subtree: true });
+    // Note: Removed noisy MutationObserver on document.body that was causing re-entrancy and spamming logs.
+    // Hash change and 1.5s interval are completely sufficient and much cleaner.
+
+    setInterval(() => {
+        const hash = window.location.hash || "";
+        if (hash.startsWith("#/home") || hash === "#/" || hash === "") {
+            const sec = document.getElementById("customRecentWatchedSection");
+            if (!sec) checkRecentSection(true);
+        }
+    }, 1500);
 
     if (document.readyState === "loading") {
         document.addEventListener("DOMContentLoaded", () => checkRecentSection(true));
@@ -1142,11 +1473,116 @@
     }
 
     window.addEventListener("hashchange", () => {
-        setTimeout(() => checkRecentSection(true), 250);
+        setTimeout(() => checkRecentSection(true), 100);
+        setTimeout(() => checkRecentSection(true), 500);
+        setTimeout(() => checkRecentSection(true), 1200);
     });
+
+    // =========================================================================
+    // 4. Header Theme Switcher (Light / Dark One-Click Toggle)
+    // =========================================================================
+    function getAppliedTheme() {
+        const themeLink = document.querySelector('link[href*="theme.css"]');
+        if (themeLink && themeLink.getAttribute('href').includes('light')) {
+            return 'light';
+        }
+        if (document.documentElement.getAttribute('data-theme') === 'light' || document.body.classList.contains('theme-light')) {
+            return 'light';
+        }
+        return 'dark';
+    }
+
+    function applyThemeMode(targetTheme) {
+        let themeLink = document.querySelector('link[href*="theme.css"]');
+        if (!themeLink) {
+            themeLink = document.createElement('link');
+            themeLink.rel = 'stylesheet';
+            themeLink.type = 'text/css';
+            document.head.appendChild(themeLink);
+        }
+        themeLink.href = targetTheme === 'light' ? 'themes/light/theme.css' : 'themes/dark/theme.css';
+        document.documentElement.setAttribute('data-theme', targetTheme);
+        if (targetTheme === 'light') {
+            document.body.classList.add('theme-light');
+            document.documentElement.classList.add('theme-light');
+        } else {
+            document.body.classList.remove('theme-light');
+            document.documentElement.classList.remove('theme-light');
+        }
+        try {
+            localStorage.setItem('jf_custom_theme', targetTheme);
+        } catch (e) {}
+        updateThemeToggleIcon(targetTheme);
+    }
+
+    function updateThemeToggleIcon(currentTheme) {
+        const iconSpan = document.getElementById('ppThemeToggleIcon');
+        const btn = document.getElementById('ppHeaderThemeToggle');
+        if (!iconSpan || !btn) return;
+        if (currentTheme === 'light') {
+            iconSpan.textContent = 'dark_mode';
+            btn.title = '切换到暗色主题 (Switch to Dark Theme)';
+        } else {
+            iconSpan.textContent = 'light_mode';
+            btn.title = '切换到亮色主题 (Switch to Light Theme)';
+        }
+    }
+
+    function setupThemeToggle() {
+        const headerRight = document.querySelector('.headerRight, .skinHeader-withBackground .headerRight');
+        if (!headerRight) return;
+        if (document.getElementById('ppHeaderThemeToggle')) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'ppHeaderThemeToggle';
+        btn.type = 'button';
+        btn.setAttribute('is', 'paper-icon-button-light');
+        btn.className = 'headerButton headerButtonRight paper-icon-button-light';
+        btn.style.marginRight = '4px';
+
+        const iconSpan = document.createElement('span');
+        iconSpan.id = 'ppThemeToggleIcon';
+        iconSpan.className = 'material-icons';
+        iconSpan.style.fontSize = '22px';
+        btn.appendChild(iconSpan);
+
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const now = getAppliedTheme();
+            const next = now === 'light' ? 'dark' : 'light';
+            applyThemeMode(next);
+        setTimeout(() => {
+            checkRecentSection(true);
+        }, 150);
+        });
+
+        const userBtn = headerRight.querySelector('.headerUserButton');
+        if (userBtn) {
+            headerRight.insertBefore(btn, userBtn);
+        } else {
+            headerRight.appendChild(btn);
+        }
+
+        const initial = getAppliedTheme();
+        updateThemeToggleIcon(initial);
+    }
+
+    // Auto-restore custom theme on initial load
+    try {
+        const savedTheme = localStorage.getItem('jf_custom_theme');
+        if (savedTheme === 'light' || savedTheme === 'dark') {
+            applyThemeMode(savedTheme);
+        }
+    } catch (e) {}
+
+    setInterval(setupThemeToggle, 1000);
+    setTimeout(setupThemeToggle, 200);
 
     window.addEventListener("focus", () => {
         checkRecentSection(true);
     });
 
+    // Mirror current state to recent.js
+    console.log("[Recent-Watched] Enhanced with theme toggle & adaptive light theme styles.");
 })();
